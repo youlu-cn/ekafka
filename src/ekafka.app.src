@@ -1,0 +1,19 @@
+%%%-------------------------------------------------------------------
+%%% @author luyou
+%%% @copyright (C) 2015, <COMPANY>
+%%% @doc
+%%%
+%%% @end
+%%% Created : 29. 十二月 2015 18:24
+%%%-------------------------------------------------------------------
+{application, ekafka, [
+    {description, ""},
+    {vsn, "1"},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib
+    ]},
+    {mod, { ekafka, []}},
+    {env, []}
+]}.

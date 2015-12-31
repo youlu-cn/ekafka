@@ -4,15 +4,15 @@
 %%% @doc
 %%%
 %%% @end
-%%% Created : 29. 十二月 2015 18:40
+%%% Created : 31. 十二月 2015 14:48
 %%%-------------------------------------------------------------------
--module(ekafka_topic_sup).
+-module(ekafka_worker_sup).
 -author("luyou").
 
 -behaviour(supervisor).
 
 %% API
--export([start_link/2, start_worker_sup/1]).
+-export([start_link/0]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -27,20 +27,10 @@
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec(start_link(Topic :: string(), Role :: atom()) ->
+-spec(start_link() ->
     {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
-start_link(Topic, Role) ->
-    supervisor:start_link({local, ekafka_util:to_atom(Topic)}, ?MODULE, {Topic, Role}).
-
-start_worker_sup(Topic) ->
-    WorkerSupSpec = {ekafka_worker_sup,
-        {ekafka_worker_sup, start_link, []},
-        temporary,
-        10000,
-        supervisor,
-        [ekafka_worker_sup]},
-
-    supervisor:start_child(ekafka_util:to_atom(Topic), WorkerSupSpec).
+start_link() ->
+    supervisor:start_link(?MODULE, []).
 
 %%%===================================================================
 %%% Supervisor callbacks
@@ -63,21 +53,21 @@ start_worker_sup(Topic) ->
     }} |
     ignore |
     {error, Reason :: term()}).
-init({Topic, Role}) ->
-    RestartStrategy = one_for_all,
-    MaxRestarts = 1,
+init([]) ->
+    RestartStrategy = simple_one_for_one,
+    MaxRestarts = 5,
     MaxSecondsBetweenRestarts = 3600,
 
     SupFlags = {RestartStrategy, MaxRestarts, MaxSecondsBetweenRestarts},
 
-    Restart = permanent,
+    Restart = temporary,
     Shutdown = 5000,
     Type = worker,
 
-    MgrChild = {ekafka_manager, {ekafka_manager, start_link, [Topic, Role]},
-        Restart, Shutdown, Type, [ekafka_manager]},
+    WorkerChild = {ekafka_worker, {ekafka_worker, start_link, []},
+        Restart, Shutdown, Type, [ekafka_worker]},
 
-    {ok, {SupFlags, [MgrChild]}}.
+    {ok, {SupFlags, [WorkerChild]}}.
 
 %%%===================================================================
 %%% Internal functions

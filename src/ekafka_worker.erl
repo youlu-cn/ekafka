@@ -4,15 +4,15 @@
 %%% @doc
 %%%
 %%% @end
-%%% Created : 29. 十二月 2015 19:36
+%%% Created : 31. 十二月 2015 15:00
 %%%-------------------------------------------------------------------
--module(ekafka_zk_manager).
+-module(ekafka_worker).
 -author("luyou").
 
 -behaviour(gen_server).
 
 %% API
--export([start_link/0]).
+-export([start_link/4]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -22,9 +22,14 @@
     terminate/2,
     code_change/3]).
 
--define(SERVER, ?MODULE).
-
--record(state, {}).
+-record(state, {sock,
+                topic,
+                part,
+                role,
+                hosts,
+                %% for consumer
+                group,
+                consume}).
 
 %%%===================================================================
 %%% API
@@ -36,10 +41,10 @@
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec(start_link() ->
+-spec(start_link(Topic :: string(), Partition :: integer(), Role :: atom(), Hosts :: any()) ->
     {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
-start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+start_link(Topic, Partition, Role, Hosts) ->
+    gen_server:start_link(?MODULE, {Topic, Partition, Role, Hosts}, []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -59,8 +64,8 @@ start_link() ->
 -spec(init(Args :: term()) ->
     {ok, State :: #state{}} | {ok, State :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term()} | ignore).
-init([]) ->
-    {ok, #state{}}.
+init({Topic, Partition, Role, Hosts}) ->
+    {ok, #state{topic = Topic, part = Partition, role = Role, hosts = Hosts}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -77,6 +82,12 @@ init([]) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
     {stop, Reason :: term(), NewState :: #state{}}).
+handle_call({produce, Key, Value}, _From, #state{topic = Topic, part = Part} = State) ->
+    _Data = handle_produce(Topic, Part, [{Key, Value}]),
+    {reply, ok, State};
+handle_call({produce, KVList}, _From, #state{topic = Topic, part = Part} = State) ->
+    _Data = handle_produce(Topic, Part, KVList),
+    {reply, ok, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -91,6 +102,12 @@ handle_call(_Request, _From, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
+handle_cast({produce_async, Key, Value}, #state{topic = Topic, part = Part} = State) ->
+    _Data = handle_produce(Topic, Part, [{Key, Value}]),
+    {noreply, State};
+handle_cast({produce_async, KVList}, #state{topic = Topic, part = Part} = State) ->
+    _Data = handle_produce(Topic, Part, KVList),
+    {noreply, State};
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -144,3 +161,8 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+handle_produce(_Topic, _Partition, _KVList) ->
+    ok.
+
+%%handle_consume() ->
+%%    ok.

@@ -4,15 +4,17 @@
 %%% @doc
 %%%
 %%% @end
-%%% Created : 29. 十二月 2015 18:41
+%%% Created : 29. 十二月 2015 19:36
 %%%-------------------------------------------------------------------
--module(ekafka_manager).
+-module(ekafka_broker_mgr).
 -author("luyou").
+
+-include("ekafka.hrl").
 
 -behaviour(gen_server).
 
 %% API
--export([start_link/2]).
+-export([start_link/0]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -22,12 +24,10 @@
     terminate/2,
     code_change/3]).
 
--record(state, {topic,
-                part,
-                role,
-                zk,
-                sup :: pid(),
-                workers}).
+-define(SERVER, ?MODULE).
+
+-record(state, {zk         :: pid() | undfined,
+                brokers}).
 
 %%%===================================================================
 %%% API
@@ -39,11 +39,10 @@
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec(start_link(Topic :: string(), Role :: atom()) ->
+-spec(start_link() ->
     {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
-start_link(Topic, Role) ->
-    Name = lists:concat([Topic, "_mgr"]),
-    gen_server:start_link({local, ekafka_util:to_atom(Name)}, ?MODULE, {Topic, Role}, []).
+start_link() ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -63,9 +62,9 @@ start_link(Topic, Role) ->
 -spec(init(Args :: term()) ->
     {ok, State :: #state{}} | {ok, State :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term()} | ignore).
-init({Topic, Role}) ->
-    erlang:send(self(), start_worker_sup),
-    {ok, #state{topic = Topic, role = Role}}.
+init([]) ->
+    erlang:send(self(), initialize),
+    {ok, #state{}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -113,34 +112,40 @@ handle_cast(_Request, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
-handle_info(start_worker_sup, #state{topic = Topic} = State) ->
-    {ok, Pid} = ekafka_topic_sup:start_worker_sup(Topic),
-    erlang:send(self(), {find_partitions, Topic}),
-    {noreply, State#state{sup = Pid}};
-handle_info({find_partitions, Topic}, State) ->
+handle_info(initialize, State) ->
+    ets:new(?EKAFKA_CONF, [set, public, named_table, {read_concurrency, true}, {keypos, #ekafka_conf.key}]),
+    ekafka_util:set_conf(broker_mgr_pid, self()),
+    case application:get_env(ekafka, conf) of
+        undefined ->
+            {stop, error_no_configuration, State};
+        {ok, Options} ->
+            lists:map(fun({Key, Value}) ->
+                ekafka_util:set_conf(ekafka_util:to_atom(Key), Value)
+            end, Options),
+            ekafka_sup:start_topics_mgr_sup(),
+            %% get brokers from zookeeper or configuration
+            case ekafka_util:get_conf(brokers) of
+                undefined ->
+                    erlang:send(self(), find_brokers);
+                _ ->
+                    ok
+            end,
+            {noreply, State}
+    end;
+handle_info(find_brokers, State) ->
     case ekafka_util:get_conf(zookeeper) of
         undefined ->
-            %%TODO: get partition metadata from kafka
-            {noreply, State};
+            {stop, error_no_zookeeper_or_brokers, State};
         ZKConf ->
             {ok, Pid} = ezk:start_connection(ZKConf),
-            Partitions = get_partition_list(Pid, Topic),
-            erlang:send(self(), start_workers),
-            {noreply, State#state{zk = Pid, part = Partitions}}
+            case get_brokers_list(Pid) of
+                [] ->
+                    {stop, error_zookeeper_error, State};
+                Brokers ->
+                    ekafka_util:set_conf(brokers, Brokers),
+                    {noreply, State#state{zk = Pid}}
+            end
     end;
-handle_info(start_workers, #state{sup = Sup, topic = Topic, part = Partitions, role = Role} = State) ->
-    Max = ekafka_util:get_max_workers(Role),
-    Workers =
-        lists:foldl(fun({Partition, Hosts}, L) ->
-            WorkerList =
-                lists:foldl(fun(_, WL) ->
-                    {ok, Pid} = supervisor:start_child(Sup, [Topic, Partition, Role, Hosts]),
-                    _Ref = erlang:monitor(process, Pid),
-                    [Pid | WL]
-                end, [], lists:seq(1, Max)),
-            [{Partition, WorkerList} | L]
-        end, [], Partitions),
-    {noreply, State#state{workers = Workers}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -177,44 +182,34 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-get_partition_list(Pid, Topic) ->
-    Path = lists:concat(["/brokers/topics/", Topic, "/partitions"]),
-    case ezk:ls(Pid, Path) of
+get_brokers_list(Pid) ->
+    case ezk:ls(Pid, "/brokers/ids") of
         {error, _Error} ->
             [];
         {ok, IDList} ->
-            get_partitions(Pid, Topic, IDList)
+            get_brokers(Pid, IDList)
     end.
 
-get_partitions(Pid, Name, PartitionIDs) ->
+get_brokers(Pid, BrokerIDs) ->
     lists:foldl(fun(ID, L) ->
-        Partition = ekafka_util:to_integer(ID),
-        Path = lists:concat(["/brokers/topics/", Name, "/partitions/", Partition, "/state"]),
+        Broker = ekafka_util:to_integer(ID),
+        Path = lists:concat(["/brokers/ids/", Broker]),
         case ezk:get(Pid, Path) of
             {error, _Error} ->
                 L;
             {ok, {Bin,_}} ->
                 Bin1 = binary:replace(Bin, [<<"{">>, <<"}">>, <<"\"">>], <<>>, [global]),
-                Leader =
-                    lists:foldl(fun(Bin2, LeadID) ->
+                Host =
+                    lists:foldl(fun(Bin2, {IP, Port}) ->
                         case Bin2 of
-                            <<"leader:", IDBin/binary>> ->
-                                ekafka_util:to_integer(IDBin);
+                            <<"host:", IPBin/binary>> ->
+                                {ekafka_util:to_ip4_address(IPBin), Port};
+                            <<"port:", PortBin/binary>> ->
+                                {IP, ekafka_util:to_integer(PortBin)};
                             _ ->
-                                LeadID
+                                {IP, Port}
                         end
-                    end, 0, binary:split(Bin1, <<",">>, [global, trim_all])),
-                [{Partition, get_leader_hosts(Leader)} | L]
+                    end, {undefined, undefined}, binary:split(Bin1, <<",">>, [global, trim_all])),
+                [{Broker, Host} | L]
         end
-    end, [], PartitionIDs).
-
-get_leader_hosts(ID) ->
-    case ekafka_util:get_conf(brokers) of
-        undefined ->
-            undefined;
-        Brokers ->
-            case lists:keyfind(ID, 1, Brokers) of
-                {ID, Hosts} -> Hosts;
-                _           -> undefined
-            end
-    end.
+    end, [], BrokerIDs).

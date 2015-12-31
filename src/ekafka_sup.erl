@@ -12,7 +12,7 @@
 -behaviour(supervisor).
 
 %% API
--export([start_link/0]).
+-export([start_link/0, start_topics_mgr_sup/0]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -33,6 +33,18 @@
     {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
+
+-spec start_topics_mgr_sup() ->
+    {ok, pid()} | any().
+start_topics_mgr_sup() ->
+    TopicsMgrSupSpec = {ekafka_topics_mgr_sup,
+        {ekafka_topics_mgr_sup, start_link, []},
+        permanent,
+        10000,
+        supervisor,
+        [ekafka_topics_mgr_sup]},
+
+    supervisor:start_child(?SERVER, TopicsMgrSupSpec).
 
 %%%===================================================================
 %%% Supervisor callbacks
@@ -56,20 +68,20 @@ start_link() ->
     ignore |
     {error, Reason :: term()}).
 init([]) ->
-    RestartStrategy = one_for_one,
-    MaxRestarts = 1000,
+    RestartStrategy = one_for_all,
+    MaxRestarts = 1,
     MaxSecondsBetweenRestarts = 3600,
 
     SupFlags = {RestartStrategy, MaxRestarts, MaxSecondsBetweenRestarts},
 
     Restart = permanent,
-    Shutdown = 2000,
+    Shutdown = 5000,
     Type = worker,
 
-    AChild = {'AName', {'AModule', start_link, []},
-        Restart, Shutdown, Type, ['AModule']},
+    BrokerMgr = {ekafka_broker_mgr, {ekafka_broker_mgr, start_link, []},
+        Restart, Shutdown, Type, [ekafka_broker_mgr]},
 
-    {ok, {SupFlags, [AChild]}}.
+    {ok, {SupFlags, [BrokerMgr]}}.
 
 %%%===================================================================
 %%% Internal functions

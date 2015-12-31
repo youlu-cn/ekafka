@@ -4,15 +4,15 @@
 %%% @doc
 %%%
 %%% @end
-%%% Created : 29. 十二月 2015 18:40
+%%% Created : 31. 十二月 2015 10:26
 %%%-------------------------------------------------------------------
--module(ekafka_partition_sup).
+-module(ekafka_topics_mgr_sup).
 -author("luyou").
 
 -behaviour(supervisor).
 
 %% API
--export([start_link/0]).
+-export([start_link/0, add_topic/2]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -33,6 +33,18 @@
     {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
+
+-spec add_topic(Topic :: string(), Role :: producer | consumer) ->
+    {ok, pid()} | any().
+add_topic(Topic, Role) ->
+    TopicSupSpec = {ekafka_topic_sup,
+        {ekafka_topic_sup, start_link, [Topic, Role]},
+        permanent,
+        10500,
+        supervisor,
+        [ekafka_topic_sup]},
+
+    supervisor:start_child(?SERVER, TopicSupSpec).
 
 %%%===================================================================
 %%% Supervisor callbacks
@@ -56,20 +68,13 @@ start_link() ->
     ignore |
     {error, Reason :: term()}).
 init([]) ->
-    RestartStrategy = one_for_one,
-    MaxRestarts = 1000,
+    RestartStrategy = one_for_all,
+    MaxRestarts = 1,
     MaxSecondsBetweenRestarts = 3600,
 
     SupFlags = {RestartStrategy, MaxRestarts, MaxSecondsBetweenRestarts},
 
-    Restart = permanent,
-    Shutdown = 2000,
-    Type = worker,
-
-    AChild = {'AName', {'AModule', start_link, []},
-        Restart, Shutdown, Type, ['AModule']},
-
-    {ok, {SupFlags, [AChild]}}.
+    {ok, {SupFlags, []}}.
 
 %%%===================================================================
 %%% Internal functions

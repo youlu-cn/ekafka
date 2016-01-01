@@ -155,9 +155,81 @@ get_max_workers(Role) ->
     case Role of
         producer ->
             case get_conf(max_workers) of
-                undefined -> ?MAX_PRODUCER_PROCESSES;
+                undefined -> ?DEFAULT_PRODUCER_PROCESSES;
                 Value     -> Value
             end;
         _ ->
             1
+    end.
+
+
+get_error_message(Code) ->
+    case Code of
+        ?NO_ERROR ->
+            "No error";
+        ?OFFSET_OUT_OF_RANGE ->
+            "The requested offset is outside the range of offsets maintained by the server for the given topic/partition";
+        ?INVALID_MESSAGE ->
+            "This indicates that a message contents does not match its CRC";
+        ?UNKNOWN_TOPIC_OR_PARTITION ->
+            "This request is for a topic or partition that does not exist on this broker";
+        ?INVALID_MESSAGE_SIZE ->
+            "The message has a negative size";
+        ?LEADER_NOT_AVAILABLE ->
+            "This error is thrown if we are in the middle of a leadership election and there is currently no leader for this partition and hence it is unavailable for writes";
+        ?NOT_LEADER_FOR_PARTITION ->
+            "This error is thrown if the client attempts to send messages to a replica that is not the leader for some partition. It indicates that the clients metadata is out of date";
+        ?REQUEST_TIMED_OUT ->
+            "This error is thrown if the request exceeds the user-specified time limit in the request";
+        ?BROKER_NOT_AVAILABLE ->
+            "This is not a client facing error and is used mostly by tools when a broker is not alive";
+        ?REPLICA_NOT_AVAILABLE ->
+            "If replica is expected on a broker, but is not (this can be safely ignored)";
+        ?MESSAGE_SIZE_TOO_LARGE ->
+            "The server has a configurable maximum message size to avoid unbounded memory allocation." ++
+                " This error is thrown if the client attempt to produce a message larger than this maximum";
+        ?STALE_CONTROLLER_EPOCH_CODE ->
+            "Internal error code for broker-to-broker communication";
+        ?OFFSET_METADATA_TOO_LARGE_CODE ->
+            "If you specify a string larger than configured maximum for offset metadata";
+        ?GROUP_LOAD_IN_PROGRESS_CODE ->
+            "The broker returns this error code for an offset fetch request if it is still loading offsets (after a leader change for that offsets topic partition)," ++
+                " or in response to group membership requests (such as heartbeats) when group metadata is being loaded by the coordinator";
+        ?GROUP_COORDINATOR_NOT_AVAILABLE_CODE ->
+            "The broker returns this error code for group coordinator requests, offset commits, and most group management requests if the offsets topic has not yet been created," ++
+                " or if the group coordinator is not active";
+        ?NOT_COORDINATOR_FOR_GROUP_CODE ->
+            "The broker returns this error code if it receives an offset fetch or commit request for a group that it is not a coordinator for";
+        ?INVALID_TOPIC_CODE ->
+            "For a request which attempts to access an invalid topic (e.g. one which has an illegal name), or if an attempt is made to write to an internal topic (such as the consumer offsets topic)";
+        ?RECORD_LIST_TOO_LARGE_CODE ->
+            "If a message batch in a produce request exceeds the maximum configured segment size";
+        ?NOT_ENOUGH_REPLICAS_CODE ->
+            "Returned from a produce request when the number of in-sync replicas is lower than the configured minimum and requiredAcks is -1";
+        ?NOT_ENOUGH_REPLICAS_AFTER_APPEND_CODE ->
+            "Returned from a produce request when the message was written to the log, but with fewer in-sync replicas than required";
+        ?INVALID_REQUIRED_ACKS_CODE ->
+            "Returned from a produce request if the requested requiredAcks is invalid (anything other than -1, 1, or 0)";
+        ?ILLEGAL_GENERATION_CODE ->
+            "Returned from group membership requests (such as heartbeats) when the generation id provided in the request is not the current generation";
+        ?INCONSISTENT_GROUP_PROTOCOL_CODE ->
+            "Returned in join group when the member provides a protocol type or set of protocols which is not compatible with the current group";
+        ?INVALID_GROUP_ID_CODE ->
+            "Returned in join group when the groupId is empty or null";
+        ?UNKNOWN_MEMBER_ID_CODE ->
+            "Returned from group requests (offset commits/fetches, heartbeats, etc) when the memberId is not in the current generation";
+        ?INVALID_SESSION_TIMEOUT_CODE ->
+            "Return in join group when the requested session timeout is outside of the allowed range on the broker";
+        ?REBALANCE_IN_PROGRESS_CODE ->
+            "Returned in heartbeat requests when the coordinator has begun rebalancing the group. This indicates to the client that it should rejoin the group";
+        ?INVALID_COMMIT_OFFSET_SIZE_CODE ->
+            "This error indicates that an offset commit was rejected because of oversize metadata";
+        ?TOPIC_AUTHORIZATION_FAILED_CODE ->
+            "Returned by the broker when the client is not authorized to access the requested topic";
+        ?GROUP_AUTHORIZATION_FAILED_CODE ->
+            "Returned by the broker when the client is not authorized to access a particular groupId";
+        ?CLUSTER_AUTHORIZATION_FAILED_CODE ->
+            "Returned by the broker when the client is not authorized to use an inter-broker or administrative API";
+        _ -> %%?UNKNOWN or others
+            "An unexpected server error"
     end.

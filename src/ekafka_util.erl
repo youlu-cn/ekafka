@@ -116,20 +116,6 @@ to_integer(Data) ->
     end.
 
 
-%% to_ip4_address/1
-%% ====================================================================
-%% @doc : covert data to ip4_address {0..255,0..255,0..255}
-%%@return: ip4_address
-to_ip4_address(Data) when erlang:is_list(Data) ->
-    to_ip4_address(to_binary(Data));
-to_ip4_address(Data) when erlang:is_binary(Data) ->
-    IntList =
-        lists:foldr(fun(Byte, L) ->
-            [to_integer(Byte) | L]
-        end, [], binary:split(Data, <<".">>, [global, trim_all])),
-    erlang:list_to_tuple(IntList).
-
-
 %% set_conf/2
 %% ====================================================================
 %% @doc : set conf
@@ -151,15 +137,63 @@ get_conf(Key) ->
             undefined
     end.
 
-get_max_workers(Role) ->
+get_tcp_options() ->
+    [binary, {active, true}, {keepalive, true}, {packet, 4}].
+
+get_worker_process_count(Role) ->
     case Role of
         producer ->
-            case get_conf(max_workers) of
+            case get_conf(produce_workers) of
                 undefined -> ?DEFAULT_PRODUCER_PROCESSES;
                 Value     -> Value
             end;
-        _ ->
-            1
+        consumer ->
+            case get_conf(consume_workers) of
+                undefined -> ?DEFAULT_CONSUMER_PROCESSES;
+                Value     -> Value
+            end
+    end.
+
+get_max_message_size() ->
+    case get_conf(max_message_bytes) of
+        undefined -> ?MAX_MESSAGE_SET_SIZE;
+        Value     -> Value
+    end.
+
+get_topic_supervisor_name(Topic) ->
+    Name = lists:concat([Topic, "_sup"]),
+    to_atom(Name).
+
+get_topic_manager_name(Topic) ->
+    Name = lists:concat([Topic, "_mgr"]),
+    to_atom(Name).
+
+get_topic_offset_mgr_name(Topic) ->
+    Name = lists:concat([Topic, "_offset_mgr"]),
+    to_atom(Name).
+
+send_to_server_sync(Sock, Request) ->
+    {API, Bin} = ekafka_protocol:encode_request(0, "sync_client", Request),
+    F = fun(Trace) ->
+            case Trace of
+                0 -> API;
+                _ -> -1
+            end
+        end,
+    case gen_tcp:send(Sock, Bin) of
+        {error, Reason} ->
+            ?ERROR("[SYNC] send to broker error: ~p", [Reason]),
+            undefined;
+        ok ->
+            receive
+                {tcp, Sock, Data} ->
+                    {_, Res} = ekafka_protocol:decode_response(F, Data),
+                    Res
+            after
+                10000 ->
+                    ?ERROR("[SYNC] timeout", []),
+                    undefined
+            end
     end.
 
 

@@ -203,7 +203,7 @@ get_brokers(Pid, BrokerIDs) ->
                     lists:foldl(fun(Bin2, {IP, Port}) ->
                         case Bin2 of
                             <<"host:", IPBin/binary>> ->
-                                {ekafka_util:to_ip4_address(IPBin), Port};
+                                {ekafka_util:to_list(IPBin), Port};
                             <<"port:", PortBin/binary>> ->
                                 {IP, ekafka_util:to_integer(PortBin)};
                             _ ->

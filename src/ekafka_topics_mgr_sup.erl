@@ -12,7 +12,7 @@
 -behaviour(supervisor).
 
 %% API
--export([start_link/0, add_topic/2]).
+-export([start_link/0, add_topic/3]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -34,17 +34,18 @@
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
--spec add_topic(Topic :: string(), Role :: producer | consumer) ->
+-spec add_topic(Topic :: string(), Role :: producer | consumer, Group :: string()) ->
     {ok, pid()} | any().
-add_topic(Topic, Role) ->
+add_topic(Topic, Role, Group) ->
     TopicSupSpec = {ekafka_topic_sup,
-        {ekafka_topic_sup, start_link, [Topic, Role]},
+        {ekafka_topic_sup, start_link, [Topic, Role, Group]},
         permanent,
         10500,
         supervisor,
         [ekafka_topic_sup]},
 
-    supervisor:start_child(?SERVER, TopicSupSpec).
+    supervisor:start_child(?SERVER, TopicSupSpec),
+    ok.
 
 %%%===================================================================
 %%% Supervisor callbacks

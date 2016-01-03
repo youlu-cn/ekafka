@@ -14,6 +14,8 @@
 %% Application callbacks
 -export([start/2, stop/1]).
 
+-export([add_producer/1, add_consumer/2]).
+
 %%%===================================================================
 %%% Application callbacks
 %%%===================================================================
@@ -42,6 +44,16 @@ start(_StartType, _StartArgs) ->
         Error ->
             Error
     end.
+
+-spec add_producer(Topic :: string()) ->
+    ok.
+add_producer(Topic) ->
+    ekafka_topics_mgr_sup:add_topic(Topic, producer, undefined).
+
+-spec add_consumer(Topic :: string(), Group :: string()) ->
+    ok.
+add_consumer(Topic, Group) ->
+    ekafka_topics_mgr_sup:add_topic(Topic, consumer, Group).
 
 %%--------------------------------------------------------------------
 %% @private

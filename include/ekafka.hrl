@@ -8,13 +8,27 @@
 %%%-------------------------------------------------------------------
 -author("luyou").
 
+
+-define(ERROR, io:format).
+-define(WARNING, io:format).
+-define(INFO, io:format).
+-define(DEBUG, io:format).
+
+
 -define(EKAFKA_CONF, ekafka_conf).
 -record(ekafka_conf, {key, value}).
+
+-record(partition, {id      :: int32(),
+                    lead    :: int32(),
+                    offset  :: int64(),
+                    isr     :: list(int32())}).
 
 
 -define(INT, signed-integer).
 
 -define(DEFAULT_PRODUCER_PROCESSES, 8).
+-define(DEFAULT_CONSUMER_PROCESSES, 1).
+-define(MAX_MESSAGE_SET_SIZE, 1024 * 1024).
 
 
 
@@ -87,52 +101,61 @@
 %% https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol
 %%
 
--record(kafka_request, {api          :: int16(),
-                        version      :: int16(),
-                        corr_id      :: int32(),
-                        client       :: int32(),
-                        request      :: #metadata_request{}           |
-                                        #produce_request{}            |
-                                        #fetch_request{}              |
-                                        #offset_request{}             |
-                                        #group_coordinator_request{}  |
-                                        #offset_commit_request{}      |
-                                        #offset_fetch_request{}       |
-                                        #join_group_request{}         |
-                                        #sync_group_request{}         |
-                                        #heartbeat_request{}          |
-                                        #leave_group_request{}        |
-                                        #list_groups_request{}        |
-                                        #describe_groups_request{}}).
-
--record(kafka_response, {corr_id     :: int32(),
-                         response    :: #metadata_response{}          |
-                                        #produce_response{}           |
-                                        #fetch_response{}             |
-                                        #offset_response{}            |
-                                        #group_coordinator_response{} |
-                                        #offset_commit_response{}     |
-                                        #offset_fetch_response{}      |
-                                        #join_group_response{}        |
-                                        #sync_group_response{}        |
-                                        #heartbeat_response{}         |
-                                        #leave_group_response{}       |
-                                        #list_groups_response{}       |
-                                        #describe_groups_response{}}).
+%%-record(kafka_request, {size         :: int32(),
+%%                        api          :: int16(),
+%%                        version      :: int16(),
+%%                        corr_id      :: int32(),
+%%                        client       :: string(),
+%%                        request      :: #metadata_request{}           |
+%%                                        #produce_request{}            |
+%%                                        #fetch_request{}              |
+%%                                        #offset_request{}             |
+%%                                        #group_coordinator_request{}  |
+%%                                        #offset_commit_request{}      |
+%%                                        #offset_fetch_request{}       |
+%%                                        #join_group_request{}         |
+%%                                        #sync_group_request{}         |
+%%                                        #heartbeat_request{}          |
+%%                                        #leave_group_request{}        |
+%%                                        #list_groups_request{}        |
+%%                                        #describe_groups_request{}}).
+%%
+%%-record(kafka_response, {size        :: int32(),
+%%                         corr_id     :: int32(),
+%%                         response    :: #metadata_response{}          |
+%%                                        #produce_response{}           |
+%%                                        #fetch_response{}             |
+%%                                        #offset_response{}            |
+%%                                        #group_coordinator_response{} |
+%%                                        #offset_commit_response{}     |
+%%                                        #offset_fetch_response{}      |
+%%                                        #join_group_response{}        |
+%%                                        #sync_group_response{}        |
+%%                                        #heartbeat_response{}         |
+%%                                        #leave_group_response{}       |
+%%                                        #list_groups_response{}       |
+%%                                        #describe_groups_response{}}).
 
 
 -record(topic, {name                 :: topic_name(),
                 partitions           :: list(partition_id())}).
 
 
-%% Kafka Message Format
+
+%% Values for #message_body.attributes
+-define(NO_COMPRESSION,     0).
+-define(GZIP_COMPRESSION,   1).
+-define(SNAPPY_COMPRESSION, 2).
+
+-record(message_body, {%crc           :: int32(), %% auto computed
+                       magic     = 0 :: int8(),  %% default 0
+                       attributes= 0 :: int8(),  %% default ?NO_COMPRESSION
+                       key           :: bytes(),
+                       value         :: bytes()}).
+
 -record(message, {offset             :: int64(),
-                  size               :: int32(),
-                  crc                :: int32(),
-                  magic              :: int8(),
-                  attributes         :: int8(),
-                  key                :: bytes(),
-                  value              :: bytes()}).
+                  %size               :: int32(),
+                  body               :: #message_body{}}).
 
 -record(message_set, {messages       :: list(#message{})}).
 
@@ -179,15 +202,20 @@
 %%  The produce API uses the generic message set format,
 %%  but since no offset has been assigned to the messages at the time of the send the producer is free to fill in that field in any way it likes.
 %% Produce Request
--record(produce_request, {acks                :: int16(),
-                          timeout             :: int32(),
+-define(ACKS_NO_RESPONSE, 0).
+-define(ACKS_WAIT_ONE,    1).
+-define(ACKS_WAIT_ALL,   -1).
+%% other values 1 .. isr (in-sync replicas)
+
+-record(produce_request, {acks        = -1    :: int16(), %% default ACKS_WAIT_ALL
+                          timeout     = 10000 :: int32(), %% default 10s
                           topics              :: list(#produce_req_topic{})}).
 
 -record(produce_req_topic, {name              :: topic_name(),
                             partitions        :: list(#produce_req_partition{})}).
 
 -record(produce_req_partition, {id            :: partition_id(),
-                                size          :: int32(),
+                                %size          :: int32(),
                                 message_set   :: #message_set{}}).
 
 %% Produce Response
@@ -208,9 +236,9 @@
 %% The fetch API is used to fetch a chunk of one or more logs for some topic-partitions.
 %%  Logically one specifies the topics, partitions, and starting offset at which to begin the fetch and gets back a chunk of messages.
 %% Fetch Request
--record(fetch_request, {replica               :: int32(), %% should always specify this as -1
-                        max_wait              :: int32(),
-                        mini_bytes            :: int32(),
+-record(fetch_request, {%replica               :: int32(), %% should always be -1
+                        max_wait      = 100   :: int32(), %% default 100ms
+                        mini_bytes    = 32768 :: int32(), %% default 32k
                         topics                :: list(#fetch_req_topic{})}).
 
 -record(fetch_req_topic, {name                :: topic_name(),
@@ -229,7 +257,7 @@
 -record(fetch_res_partition, {id              :: partition_id(),
                               error           :: int16(),
                               hm_offset       :: int64(),
-                              size            :: int32(),
+                              %size            :: int32(),
                               message_set     :: #message_set{}}).
 
 
@@ -295,7 +323,7 @@
 
 %% Offset Fetch Request
 -record(offset_fetch_request, {group_id       :: group_id(),
-                                   topics         :: list(#offset_fetch_req_topic{})}).
+                               topics         :: list(#offset_fetch_req_topic{})}).
 
 -record(offset_fetch_req_topic, {name         :: topic_name(),
                                  partitions   :: list(partition_id())}).

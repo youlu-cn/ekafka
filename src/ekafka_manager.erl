@@ -9,10 +9,12 @@
 -module(ekafka_manager).
 -author("luyou").
 
+-include("ekafka.hrl").
+
 -behaviour(gen_server).
 
 %% API
--export([start_link/2]).
+-export([start_link/3]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -22,11 +24,11 @@
     terminate/2,
     code_change/3]).
 
--record(state, {topic,
-                part,
-                role,
-                zk,
-                sup :: pid(),
+-record(state, {topic         :: string(),
+                partitions    :: [#partition{}],
+                role          :: atom(),
+                group         :: string(),
+                sup           :: pid(),
                 workers}).
 
 %%%===================================================================
@@ -39,11 +41,10 @@
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec(start_link(Topic :: string(), Role :: atom()) ->
+-spec(start_link(Topic :: string(), Role :: atom(), Group :: string()) ->
     {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
-start_link(Topic, Role) ->
-    Name = lists:concat([Topic, "_mgr"]),
-    gen_server:start_link({local, ekafka_util:to_atom(Name)}, ?MODULE, {Topic, Role}, []).
+start_link(Topic, Role, Group) ->
+    gen_server:start_link({local, ekafka_util:get_topic_manager_name(Topic)}, ?MODULE, {Topic, Role, Group}, []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -63,9 +64,9 @@ start_link(Topic, Role) ->
 -spec(init(Args :: term()) ->
     {ok, State :: #state{}} | {ok, State :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term()} | ignore).
-init({Topic, Role}) ->
+init({Name, Role, Group}) ->
     erlang:send(self(), start_worker_sup),
-    {ok, #state{topic = Topic, role = Role}}.
+    {ok, #state{topic = Name, role = Role, group = Group}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -82,6 +83,15 @@ init({Topic, Role}) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
     {stop, Reason :: term(), NewState :: #state{}}).
+handle_call({pick_worker, Key}, _From, #state{workers = Workers} = State) ->
+    case Key of
+        undefined ->
+            [{ID1, [Pid1 | Others]} | T1] = Workers,
+            {reply, {ok, Pid1}, State#state{workers = T1 ++ [{ID1, Others ++ [Pid1]}]}};
+        _ ->
+            PartID = erlang:phash2(Key, erlang:length(Workers)),
+    end,
+    {reply, {ok, Pid}, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -113,32 +123,43 @@ handle_cast(_Request, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
-handle_info(start_worker_sup, #state{topic = Topic} = State) ->
-    {ok, Pid} = ekafka_topic_sup:start_worker_sup(Topic),
-    erlang:send(self(), {find_partitions, Topic}),
+handle_info(start_worker_sup, #state{topic = Name} = State) ->
+    {ok, Pid} = ekafka_topic_sup:start_worker_sup(Name),
+    erlang:send(self(), get_topic_metadata),
     {noreply, State#state{sup = Pid}};
-handle_info({find_partitions, Topic}, State) ->
-    case ekafka_util:get_conf(zookeeper) of
+handle_info(get_topic_metadata, #state{topic = Name} = State) ->
+    case get_topic_metadata(Name) of
         undefined ->
-            %%TODO: get partition metadata from kafka
+            {stop, error_socket_error, State};
+        {?NO_ERROR, _Brokers, Partitions} ->
+            erlang:send(self(), start_offset_mgr),
+            {noreply, State#state{partitions = Partitions}};
+        {?UNKNOWN, undefined} ->
+            erlang:send_after(5000, self(), get_topic_metadata),
             {noreply, State};
-        ZKConf ->
-            {ok, Pid} = ezk:start_connection(ZKConf),
-            Partitions = get_partition_list(Pid, Topic),
-            erlang:send(self(), start_workers),
-            {noreply, State#state{zk = Pid, part = Partitions}}
+        {_, undefined} ->
+            {stop, error_kafka_server_error, State}
     end;
-handle_info(start_workers, #state{sup = Sup, topic = Topic, part = Partitions, role = Role} = State) ->
-    Max = ekafka_util:get_max_workers(Role),
+handle_info(start_offset_mgr, #state{topic = Name, group = Group, partitions = Partitions, role = Role} = State) ->
+    case Role of
+        consumer ->
+            ekafka_topic_sup:start_offset_manager(Name, Group, Partitions);
+        _ ->
+            ok
+    end,
+    erlang:send(self(), start_workers),
+    {noreply, State};
+handle_info(start_workers, #state{sup = Sup, topic = Name, partitions = Partitions, role = Role} = State) ->
+    Max = ekafka_util:get_worker_process_count(Role),
     Workers =
-        lists:foldl(fun({Partition, Hosts}, L) ->
-            WorkerList =
-                lists:foldl(fun(_, WL) ->
-                    {ok, Pid} = supervisor:start_child(Sup, [Topic, Partition, Role, Hosts]),
+        lists:foldl(fun(#partition{id = ID} = Partition, L1) ->
+            PartWorkers =
+                lists:foldl(fun(_, L2) ->
+                    {ok, Pid} = supervisor:start_child(Sup, [Name, Partition, Role]),
                     _Ref = erlang:monitor(process, Pid),
-                    [Pid | WL]
+                    [Pid | L2]
                 end, [], lists:seq(1, Max)),
-            [{Partition, WorkerList} | L]
+            [{ID, PartWorkers} | L1]
         end, [], Partitions),
     {noreply, State#state{workers = Workers}};
 handle_info(_Info, State) ->
@@ -177,44 +198,55 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-get_partition_list(Pid, Topic) ->
-    Path = lists:concat(["/brokers/topics/", Topic, "/partitions"]),
-    case ezk:ls(Pid, Path) of
-        {error, _Error} ->
-            [];
-        {ok, IDList} ->
-            get_partitions(Pid, Topic, IDList)
-    end.
+to_partition(#metadata_res_partition{id = ID, leader = Lead, isr = Isr}) ->
+    #partition{id = ID, lead = Lead, isr = Isr}.
+to_partitions([#metadata_res_partition{}|_] = List) ->
+    lists:foldr(fun(Partition, L) ->
+        [to_partition(Partition) | L]
+    end, [], List).
 
-get_partitions(Pid, Name, PartitionIDs) ->
-    lists:foldl(fun(ID, L) ->
-        Partition = ekafka_util:to_integer(ID),
-        Path = lists:concat(["/brokers/topics/", Name, "/partitions/", Partition, "/state"]),
-        case ezk:get(Pid, Path) of
-            {error, _Error} ->
-                L;
-            {ok, {Bin,_}} ->
-                Bin1 = binary:replace(Bin, [<<"{">>, <<"}">>, <<"\"">>], <<>>, [global]),
-                Leader =
-                    lists:foldl(fun(Bin2, LeadID) ->
-                        case Bin2 of
-                            <<"leader:", IDBin/binary>> ->
-                                ekafka_util:to_integer(IDBin);
-                            _ ->
-                                LeadID
-                        end
-                    end, 0, binary:split(Bin1, <<",">>, [global, trim_all])),
-                [{Partition, get_leader_hosts(Leader)} | L]
-        end
-    end, [], PartitionIDs).
 
-get_leader_hosts(ID) ->
-    case ekafka_util:get_conf(brokers) of
+get_topic_metadata(Name) ->
+    [{_,Host}|_T] = ekafka_util:get_conf(brokers),
+    case request_topic_metadata(Host, Name) of
         undefined ->
             undefined;
-        Brokers ->
-            case lists:keyfind(ID, 1, Brokers) of
-                {ID, Hosts} -> Hosts;
-                _           -> undefined
+        #metadata_response{brokers = Brokers, topics = [#metadata_res_topic{error = E1, partitions = Partitions}]} ->
+            case E1 of
+                ?NO_ERROR ->
+                    Err =
+                        lists:foldl(fun(#metadata_res_partition{error = E2, leader = Lead}, Acc) ->
+                            case {Lead, E2, Acc} of
+                                {-1, _, _}                -> ?UNKNOWN;
+                                {_, ?NO_ERROR, ?NO_ERROR} -> ?NO_ERROR;
+                                {_, E3, _}                -> E3
+                            end
+                        end, 0, Partitions),
+                    case Err of
+                        ?NO_ERROR ->
+                            {?NO_ERROR, Brokers, to_partitions(Partitions)};
+                        ?UNKNOWN ->
+                            ?INFO("[MGR] broker lead is in election, try later", []),
+                            {?UNKNOWN, undefined};
+                        _ ->
+                            ?ERROR("[MGR] Kafka response error: ~p", [ekafka_util:get_error_message(E1)]),
+                            {Err, undefined}
+                    end;
+                _ ->
+                    ?ERROR("[MGR] Kafka response error: ~p", [ekafka_util:get_error_message(E1)]),
+                    {E1, undefined}
             end
     end.
+
+request_topic_metadata({IP, Port} = Host, Name) ->
+    case gen_tcp:connect(IP, Port, ekafka_util:get_tcp_options()) of
+        {error, Reason} ->
+            ?ERROR("[MGR] connect to broker ~p error: ~p", [Host, Reason]),
+            undefined;
+        {ok, Sock} ->
+            Request = #metadata_request{topics = [Name]},
+            Res = ekafka_util:send_to_server_sync(Sock, Request),
+            gen_tcp:close(Sock),
+            Res
+    end.
+

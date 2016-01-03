@@ -9,10 +9,12 @@
 -module(ekafka_topic_sup).
 -author("luyou").
 
+-include("ekafka.hrl").
+
 -behaviour(supervisor).
 
 %% API
--export([start_link/2, start_worker_sup/1]).
+-export([start_link/3, start_worker_sup/1, start_offset_manager/3]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -27,11 +29,13 @@
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec(start_link(Topic :: string(), Role :: atom()) ->
+-spec(start_link(Topic :: string(), Role :: atom(), Group :: string()) ->
     {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
-start_link(Topic, Role) ->
-    supervisor:start_link({local, ekafka_util:to_atom(Topic)}, ?MODULE, {Topic, Role}).
+start_link(Topic, Role, Group) ->
+    supervisor:start_link({local, ekafka_util:get_topic_supervisor_name(Topic)}, ?MODULE, {Topic, Role, Group}).
 
+-spec start_worker_sup(Topic :: string()) ->
+    {ok, Pid :: pid()} | any().
 start_worker_sup(Topic) ->
     WorkerSupSpec = {ekafka_worker_sup,
         {ekafka_worker_sup, start_link, []},
@@ -40,7 +44,26 @@ start_worker_sup(Topic) ->
         supervisor,
         [ekafka_worker_sup]},
 
-    supervisor:start_child(ekafka_util:to_atom(Topic), WorkerSupSpec).
+    supervisor:start_child(ekafka_util:get_topic_supervisor_name(Topic), WorkerSupSpec).
+
+-spec start_offset_manager(Topic :: string(), Group :: string(), Partitions :: list(#partition{})) ->
+    {ok, Pid :: pid()} | any().
+start_offset_manager(Topic, Group, Partitions) ->
+    Restart = permanent,
+    Shutdown = 5000,
+    Type = worker,
+
+    OffsetMgrSpec =
+        case ekafka_util:get_conf(zookeeper) of
+            undefined ->
+                {ekafka_offset_mgr, {ekafka_offset_mgr, start_link, [Topic, Group, Partitions]},
+                    Restart, Shutdown, Type, [ekafka_offset_mgr]};
+            _ ->
+                {ekafka_zk_offset_mgr, {ekafka_zk_offset_mgr, start_link, [Topic, Group, Partitions]},
+                    Restart, Shutdown, Type, [ekafka_zk_offset_mgr]}
+        end,
+
+    supervisor:start_child(ekafka_util:get_topic_supervisor_name(Topic), OffsetMgrSpec).
 
 %%%===================================================================
 %%% Supervisor callbacks
@@ -63,7 +86,7 @@ start_worker_sup(Topic) ->
     }} |
     ignore |
     {error, Reason :: term()}).
-init({Topic, Role}) ->
+init({Topic, Role, Group}) ->
     RestartStrategy = one_for_all,
     MaxRestarts = 1,
     MaxSecondsBetweenRestarts = 3600,
@@ -74,8 +97,15 @@ init({Topic, Role}) ->
     Shutdown = 5000,
     Type = worker,
 
-    MgrChild = {ekafka_manager, {ekafka_manager, start_link, [Topic, Role]},
-        Restart, Shutdown, Type, [ekafka_manager]},
+    MgrChild =
+        case ekafka_util:get_conf(zookeeper) of
+            undefined ->
+                {ekafka_manager, {ekafka_manager, start_link, [Topic, Role, Group]},
+                    Restart, Shutdown, Type, [ekafka_manager]};
+            _ ->
+                {ekafka_zk_manager, {ekafka_zk_manager, start_link, [Topic, Role, Group]},
+                    Restart, Shutdown, Type, [ekafka_zk_manager]}
+        end,
 
     {ok, {SupFlags, [MgrChild]}}.
 

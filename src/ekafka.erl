@@ -14,7 +14,7 @@
 %% Application callbacks
 -export([start/2, stop/1]).
 
--export([add_producer/1, add_consumer/2]).
+-export([add_producer/1, add_consumer/2, produce/2]).
 
 %%%===================================================================
 %%% Application callbacks
@@ -49,6 +49,18 @@ start(_StartType, _StartArgs) ->
     ok.
 add_producer(Topic) ->
     ekafka_topics_mgr_sup:add_topic(Topic, producer, undefined).
+
+-spec produce(Topic :: string(), tuple() | list(tuple())) ->
+    {error, any()} | ok.
+produce(Topic, {Key, Value}) ->
+    produce(Topic, [{Key, Value}]);
+produce(Topic, [{Key, _V}|_] = KVList) ->
+    case gen_server:call(ekafka_util:get_topic_manager_name(Topic), {pick_worker, Key}) of
+        {ok, Pid} ->
+            gen_server:call(Pid, {produce, sync, KVList});
+        {error, Error} ->
+            {error, Error}
+    end.
 
 -spec add_consumer(Topic :: string(), Group :: string()) ->
     ok.

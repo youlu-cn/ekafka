@@ -9,10 +9,24 @@
 -author("luyou").
 
 
+%% Logs
 -define(ERROR, io:format).
 -define(WARNING, io:format).
 -define(INFO, io:format).
 -define(DEBUG, io:format).
+
+
+%% Types
+-type int8()  :: integer().
+-type int16() :: integer().
+-type int32() :: integer().
+-type int64() :: integer().
+-type bytes() :: binary().
+
+-type topic_name()        :: string().
+-type partition_id()      :: int32().
+-type group_id()          :: string().
+-type group_member_id()   :: string().
 
 
 -define(EKAFKA_CONF, ekafka_conf).
@@ -84,18 +98,6 @@
 -define(CLUSTER_AUTHORIZATION_FAILED_CODE,      31).
 
 
-%% Types
--type int8()  :: integer().
--type int16() :: integer().
--type int32() :: integer().
--type int64() :: integer().
--type bytes() :: binary().
-
--type topic_name()        :: string().
--type partition_id()      :: int32().
--type group_id()          :: string().
--type group_member_id()   :: string().
-
 
 %%
 %% https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol
@@ -153,7 +155,7 @@
                        key           :: bytes(),
                        value         :: bytes()}).
 
--record(message, {offset             :: int64(),
+-record(message, {offset         = 0 :: int64(),
                   %size               :: int32(),
                   body               :: #message_body{}}).
 
@@ -175,22 +177,22 @@
 %% The response contains metadata for each partition, with partitions grouped together by topic.
 %%  This metadata refers to brokers by their broker id. The brokers each have a host and port.
 %% Metadata Response
--record(metadata_response, {brokers           :: list(#metadata_res_broker{}),
-                            topics            :: list(#metadata_res_topic{})}).
-
 -record(metadata_res_broker, {id              :: int32(),
                               host            :: string(),
                               port            :: int32()}).
-
--record(metadata_res_topic, {error            :: int16(),
-                             name             :: topic_name(),
-                             partitions       :: list(#metadata_res_partition{})}).
 
 -record(metadata_res_partition, {error        :: int16(),
                                  id           :: partition_id(),
                                  leader       :: int32(),
                                  replicas     :: list(int32()),
                                  isr          :: list(int32())}).
+
+-record(metadata_res_topic, {error            :: int16(),
+                             name             :: topic_name(),
+                             partitions       :: list(#metadata_res_partition{})}).
+
+-record(metadata_response, {brokers           :: list(#metadata_res_broker{}),
+                            topics            :: list(#metadata_res_topic{})}).
 
 
 %%
@@ -202,31 +204,31 @@
 %%  The produce API uses the generic message set format,
 %%  but since no offset has been assigned to the messages at the time of the send the producer is free to fill in that field in any way it likes.
 %% Produce Request
--define(ACKS_NO_RESPONSE, 0).
+-define(ACKS_NO_RESPONSE, 0). %% WARN: socket was closed by kafka on my machine, don't know why yet, don't use
 -define(ACKS_WAIT_ONE,    1).
 -define(ACKS_WAIT_ALL,   -1).
 %% other values 1 .. isr (in-sync replicas)
-
--record(produce_request, {acks        = -1    :: int16(), %% default ACKS_WAIT_ALL
-                          timeout     = 10000 :: int32(), %% default 10s
-                          topics              :: list(#produce_req_topic{})}).
-
--record(produce_req_topic, {name              :: topic_name(),
-                            partitions        :: list(#produce_req_partition{})}).
 
 -record(produce_req_partition, {id            :: partition_id(),
                                 %size          :: int32(),
                                 message_set   :: #message_set{}}).
 
+-record(produce_req_topic, {name              :: topic_name(),
+                            partitions        :: list(#produce_req_partition{})}).
+
+-record(produce_request, {acks        = -1    :: int16(), %% default ACKS_WAIT_ALL
+                          timeout     = 10000 :: int32(), %% default 10s
+                          topics              :: list(#produce_req_topic{})}).
+
 %% Produce Response
--record(produce_response, {topics             :: list(#produce_res_topic{})}).
+-record(produce_res_partition, {id            :: partition_id(),
+                                error         :: int16(),
+                                offset        :: int64()}).
 
 -record(produce_res_topic, {name              :: topic_name(),
                             partitions        :: list(#produce_res_partition{})}).
 
--record(produce_res_partition, {id            :: partition_id(),
-                                error         :: int16(),
-                                offset        :: int64()}).
+-record(produce_response, {topics             :: list(#produce_res_topic{})}).
 
 
 %%
@@ -236,29 +238,29 @@
 %% The fetch API is used to fetch a chunk of one or more logs for some topic-partitions.
 %%  Logically one specifies the topics, partitions, and starting offset at which to begin the fetch and gets back a chunk of messages.
 %% Fetch Request
+-record(fetch_req_partition, {id              :: partition_id(),
+                              offset          :: int64(),
+                              max_bytes       :: int32()}).
+
+-record(fetch_req_topic, {name                :: topic_name(),
+                          partitions          :: list(#fetch_req_partition{})}).
+
 -record(fetch_request, {%replica               :: int32(), %% should always be -1
                         max_wait      = 100   :: int32(), %% default 100ms
                         mini_bytes    = 32768 :: int32(), %% default 32k
                         topics                :: list(#fetch_req_topic{})}).
 
--record(fetch_req_topic, {name                :: topic_name(),
-                          partitions          :: list(#fetch_req_partition{})}).
-
--record(fetch_req_partition, {id              :: partition_id(),
-                              offset          :: int64(),
-                              max_bytes       :: int32()}).
-
 %% Fetch Response
--record(fetch_response, {topics               :: list(#fetch_res_topic{})}).
-
--record(fetch_res_topic, {name                :: topic_name(),
-                          partitions          :: list(#fetch_res_partition{})}).
-
 -record(fetch_res_partition, {id              :: partition_id(),
                               error           :: int16(),
                               hm_offset       :: int64(),
                               %size            :: int32(),
                               message_set     :: #message_set{}}).
+
+-record(fetch_res_topic, {name                :: topic_name(),
+                          partitions          :: list(#fetch_res_partition{})}).
+
+-record(fetch_response, {topics               :: list(#fetch_res_topic{})}).
 
 
 
@@ -270,25 +272,25 @@
 %%  As with the produce and fetch APIs requests must be directed to the broker that is currently the leader for the partitions in question.
 %%  This can be determined using the metadata API.
 %% Offset Request
--record(offset_request, {replica              :: int32(),
-                         topics               :: list(#offset_req_topic{})}).
-
--record(offset_req_topic, {name               :: topic_name(),
-                           partitions         :: list(#offset_req_partition{})}).
-
 -record(offset_req_partition, {id             :: partition_id(),
                                time           :: int64(),
                                max_num        :: int32()}).
 
+-record(offset_req_topic, {name               :: topic_name(),
+                           partitions         :: list(#offset_req_partition{})}).
+
+-record(offset_request, {replica              :: int32(),
+                         topics               :: list(#offset_req_topic{})}).
+
 %% Offset Response
--record(offset_response, {topics              :: list(#offset_res_topic{})}).
+-record(offset_res_partition, {id             :: partition_id(),
+                               error          :: int16(),
+                               offset         :: int64()}).
 
 -record(offset_res_topic, {name               :: topic_name(),
                            partitions         :: list(#offset_res_partition{})}).
 
--record(offset_res_partition, {id             :: partition_id(),
-                               error          :: int16(),
-                               offset         :: int64()}).
+-record(offset_response, {topics              :: list(#offset_res_topic{})}).
 
 
 
@@ -312,33 +314,33 @@
 -record(offset_commit_request, {}).
 
 %% Offset Commit Response
--record(offset_commit_response, {topics       :: list(#offset_commit_res_topic{})}).
+-record(offset_commit_res_partition, {id      :: partition_id(),
+                                      error   :: int16()}).
 
 -record(offset_commit_res_topic, {name        :: topic_name(),
                                   partitions  :: list(#offset_commit_res_partition{})}).
 
--record(offset_commit_res_partition, {id      :: partition_id(),
-                                      error   :: int16()}).
+-record(offset_commit_response, {topics       :: list(#offset_commit_res_topic{})}).
 
 
 %% Offset Fetch Request
--record(offset_fetch_request, {group_id       :: group_id(),
-                               topics         :: list(#offset_fetch_req_topic{})}).
-
 -record(offset_fetch_req_topic, {name         :: topic_name(),
                                  partitions   :: list(partition_id())}).
 
+-record(offset_fetch_request, {group_id       :: group_id(),
+                               topics         :: list(#offset_fetch_req_topic{})}).
+
 
 %% Offset Fetch Response
--record(offset_fetch_response, {topics        :: list(#offset_fetch_res_topic{})}).
-
--record(offset_fetch_res_topic, {name         :: topic_name(),
-                                 partitions   :: list(#offset_fetch_res_partition{})}).
-
 -record(offset_fetch_res_partition, {id       :: partition_id(),
                                      offset   :: int64(),
                                      metadata :: string(),
                                      error    :: int16()}).
+
+-record(offset_fetch_res_topic, {name         :: topic_name(),
+                                 partitions   :: list(#offset_fetch_res_partition{})}).
+
+-record(offset_fetch_response, {topics        :: list(#offset_fetch_res_topic{})}).
 
 
 %%
@@ -349,18 +351,21 @@
 %% Join Group Request
 %%  For consumer group
 %%  protocol type should be "consumer"
+-record(join_group_req_protocol, {name        :: string(),
+                                  version     :: int16(),
+                                  subscription:: list(topic_name()),
+                                  userdata    :: bytes()}).
+
 -record(join_group_request, {id               :: group_id(),
                              timeout          :: int32(),
                              member           :: string(),
                              proto_type       :: string(),
                              protocols        :: list(#join_group_req_protocol{})}).
 
--record(join_group_req_protocol, {name        :: string(),
-                                  version     :: int16(),
-                                  subscription:: list(topic_name()),
-                                  userdata    :: bytes()}).
-
 %% Join Group Response
+-record(join_group_res_member, {id            :: group_member_id(),
+                                metadata      :: bytes()}).
+
 -record(join_group_response, {error           :: int16(),
                               generation      :: int32(),
                               protocol        :: string(),
@@ -368,22 +373,19 @@
                               id              :: group_member_id(),
                               members         :: list(#join_group_res_member{})}).
 
--record(join_group_res_member, {id            :: group_member_id(),
-                                metadata      :: bytes()}).
-
 %% Sync Group Request
--record(sync_group_request, {id               :: group_id(),
-                             generation       :: int32(),
-                             member_id        :: group_member_id(),
-                             assignment       :: list(#sync_group_req_assignment{})}).
-
--record(sync_group_req_assignment, {id        :: group_member_id(),
-                                    assignment:: #group_member_assignment{}}).
-
 %% Consumer Groups: The format of the MemberAssignment field for consumer groups is included below:
 -record(group_member_assignment, {version     :: int16(),
                                   partitions  :: list(#topic{}),
                                   user_data   :: bytes()}).
+
+-record(sync_group_req_assignment, {id        :: group_member_id(),
+                                    assignment:: #group_member_assignment{}}).
+
+-record(sync_group_request, {id               :: group_id(),
+                             generation       :: int32(),
+                             member_id        :: group_member_id(),
+                             assignment       :: list(#sync_group_req_assignment{})}).
 
 %% Sync Group Response
 -record(sync_group_response, {error           :: int16(),
@@ -416,17 +418,22 @@
 -record(list_groups_request, {}).
 
 %% List Groups Response
--record(list_groups_response, {error          :: int16(),
-                               groups         :: list(#list_groups_res_group{})}).
-
 -record(list_groups_res_group, {id            :: group_id(),
                                 proto_type    :: string()}).
+
+-record(list_groups_response, {error          :: int16(),
+                               groups         :: list(#list_groups_res_group{})}).
 
 %% Describe Groups Request
 -record(describe_groups_request, {groups      :: list(group_id())}).
 
 %% Describe Groups Response
--record(describe_groups_response, {groups     :: list(#describe_groups_res_group{})}).
+-record(describe_groups_res_group_member,
+                            {id               :: group_member_id(),
+                             client           :: string(),
+                             host             :: string(),
+                             metadata         :: bytes(),
+                             assignment       :: #group_member_assignment{}}).
 
 -record(describe_groups_res_group, {error     :: int16(),
                                     id        :: group_id(),
@@ -435,10 +442,5 @@
                                     protocol  :: string(),
                                     members   :: list(#describe_groups_res_group_member{})}).
 
--record(describe_groups_res_group_member,
-                            {id               :: group_member_id(),
-                             client           :: string(),
-                             host             :: string(),
-                             metadata         :: bytes(),
-                             assignment       :: #group_member_assignment{}}).
+-record(describe_groups_response, {groups     :: list(#describe_groups_res_group{})}).
 

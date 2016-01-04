@@ -148,10 +148,7 @@ get_worker_process_count(Role) ->
                 Value     -> Value
             end;
         consumer ->
-            case get_conf(consume_workers) of
-                undefined -> ?DEFAULT_CONSUMER_PROCESSES;
-                Value     -> Value
-            end
+            ?DEFAULT_CONSUMER_PROCESSES
     end.
 
 get_max_message_size() ->
@@ -161,7 +158,7 @@ get_max_message_size() ->
     end.
 
 get_topic_supervisor_name(Topic) ->
-    Name = lists:concat([Topic, "_sup"]),
+    Name = lists:concat([Topic, "_topic_sup"]),
     to_atom(Name).
 
 get_topic_manager_name(Topic) ->
@@ -171,6 +168,12 @@ get_topic_manager_name(Topic) ->
 get_topic_offset_mgr_name(Topic) ->
     Name = lists:concat([Topic, "_offset_mgr"]),
     to_atom(Name).
+
+get_partition_assignment() ->
+    case get_conf(hash_partition_by_key) of
+        undefined -> false;
+        Value     -> Value
+    end.
 
 send_to_server_sync(Sock, Request) ->
     {API, Bin} = ekafka_protocol:encode_request(0, "sync_client", Request),

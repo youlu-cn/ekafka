@@ -33,7 +33,7 @@
                 partition      :: #partition{},
                 role,
                 trace_id,
-                dict           :: dict(#request_state{}),
+                dict           :: dict:dict(int32(), #request_state{}),
                 offset}).
 
 %%%===================================================================
@@ -46,7 +46,7 @@
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec(start_link(Name :: string(), Partition :: #metadata_res_partition{}, Role :: producer | consumer) ->
+-spec(start_link(Name :: string(), Partition :: #partition{}, Role :: producer | consumer) ->
     {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
 start_link(Name, Partition, Role) ->
     gen_server:start_link(?MODULE, {Name, Partition, Role}, []).
@@ -92,6 +92,7 @@ handle_call({produce, Type, KVList}, From, #state{topic = Topic, partition = Par
     case Role of
         producer ->
             Request = handle_produce(Topic, Part, KVList),
+            ?DEBUG("[W] produce request data: ~p~n", [Request]),
             NewTrace = get_trace_id(Trace),
             %% Type :: atom(), sync | async
             erlang:spawn(?MODULE, send_request, [Sock, {Type, From, self(), NewTrace, Request}]),
@@ -141,44 +142,75 @@ handle_cast(_Request, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
-handle_info(start_connection, #state{partition = #metadata_res_partition{leader = Lead}} = State) ->
-    case lists:keyfind(Lead, 1, ekafka_util:get_conf(brokers)) of
-        false ->
-            {stop, broker_not_found, State};
-        {Lead, {Host, Port}} ->
-            case gen_tcp:connect(Host, Port, ekafka_util:get_tcp_options()) of
-                {ok, Sock} ->
+handle_info(start_connection, #state{topic = Name, partition = #partition{id = ID, lead = Lead}} = State) ->
+    ?DEBUG("[W] start worker connection, topic: ~p, partition: ~p~n", [Name, ID]),
+    case connect_to_lead_broker(Lead) of
+        undefined ->
+            ?ERROR("[W] init failed to connect broker, exit..~n", []),
+            {stop, broker_not_connected, State};
+        {ok, Sock} ->
+            erlang:send_after(5000, self(), sync_offset),
+            {noreply, State#state{sock = Sock}}
+    end;
+handle_info(sync_offset, #state{topic = Name, role = Role, partition = #partition{id = PartID}} = State) ->
+    case Role of
+        producer ->
+            {noreply, State};
+        consumer ->
+            case sync_message_offset(Name, PartID) of
+                {ok, undefined} ->
+                    ?WARNING("[W] still getting offset, try later~n", []),
                     erlang:send_after(5000, self(), sync_offset),
-                    {noreply, State#state{sock = Sock}};
-                {error, Reason} ->
-                    ?ERROR("[W] connect to broker ~p failed", [Host]),
-                    {stop, Reason, State}
+                    {noreply, State};
+                {ok, Offset} ->
+                    ?INFO("[W] offset ~p received, ~p:~p~n", [Offset, Name, PartID]),
+                    {noreply, State#state{offset = Offset}}
             end
     end;
-handle_info(sync_offset, #state{topic = Name, partition = #partition{id = PartID}} = State) ->
-    case sync_message_offset(Name, PartID) of
-        {ok, undefined} ->
-            erlang:send_after(5000, self(), sync_offset),
-            {noreply, State};
-        {ok, Offset} ->
-            {noreply, State#state{offset = Offset}}
-    end;
+
+%% handle socket
 handle_info({tcp, Sock, Data}, #state{sock = Sock, dict = Dict} = State) ->
+    ?DEBUG("[W] tcp data received, ~p~n", [self()]),
     erlang:spawn(?MODULE, decode_response, [{?MODULE, query_response_api, Dict}, self(), Data]),
     {noreply, State};
+handle_info({re_connect, Reason, Times}, #state{topic = Name, partition = #partition{id = ID, lead = Lead}} = State) ->
+    ?DEBUG("[W] reconnecting to broker ~p, reason: ~p, topic: ~p, partition: ~p~n", [Times, Reason, Name, ID]),
+    case connect_to_lead_broker(Lead) of
+        undefined ->
+            erlang:send_after(5000, self(), {re_connect, Reason, Times + 1}),
+            {noreply, State};
+        {ok, Sock} ->
+            {noreply, State#state{sock = Sock}}
+    end;
+handle_info({tcp_closed, _Sock}, State) ->
+    %%TODO: don't assign works before re-connected
+    erlang:send_after(5000, self(), {re_connect, tcp_closed, 1}),
+    {noreply, State};
+handle_info({tcp_error, _Sock, Reason}, State) ->
+    %%TODO: don't assign works before re-connected
+    ?DEBUG("[W] tcp error occurs, ~p~n", [Reason]),
+    erlang:send_after(5000, self(), {re_connect, tcp_error, 1}),
+    {noreply, State};
+
+%% handle request callback
 handle_info({request_sent, Type, From, Trace, API}, #state{dict = Dict} = State) ->
+    ?DEBUG("[W] request has been sent, type ~p, trace: ~p, api: ~p~n", [Type, Trace, API]),
+    case Type of
+        async -> gen_server:reply(From, ok);
+        _     -> ok
+    end,
     RS = #request_state{type = Type, from = From, api = API},
     {noreply, State#state{dict = dict:store(Trace, RS, Dict)}};
 handle_info({request_failed, Type, From, Reason}, State) ->
     case Type of
         internal ->
-            ?ERROR("[W] internal error", []);
-        sync ->
-            gen_server:reply(From, {error, Reason});
-        async ->
-            erlang:send(From, {ekafka, error, Reason})
+            ?ERROR("[W] internal error: ~p~n", [Reason]);
+        _ -> %% sync or async
+            gen_server:reply(From, {error, Reason})
     end,
     {noreply, State};
+
+%% handle response callback
 handle_info({response_received, CorrId, Response}, #state{topic = Name, dict = Dict, partition = #partition{id = PartID}} = State) ->
     #request_state{type = Type, from = From} = dict:fetch(CorrId, Dict),
     case Response of
@@ -196,13 +228,15 @@ handle_info({response_error, CorrId}, #state{dict = Dict} = State) ->
     #request_state{type = Type, from = From} = dict:fetch(CorrId, Dict),
     case Type of
         internal ->
-            ?ERROR("[W] internal error", []);
+            ?ERROR("[W] internal error~n", []);
         sync ->
             gen_server:reply(From, {error, server_error});
         async ->
             erlang:send(From, {ekafka, error, server_error})
     end,
     {noreply, State#state{dict = dict:erase(CorrId, Dict)}};
+
+%% Others
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -239,6 +273,21 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+connect_to_lead_broker(Lead) ->
+    case lists:keyfind(Lead, 1, ekafka_util:get_conf(brokers)) of
+        false ->
+            ?ERROR("[W] cannot found lead ~p broker in: ~p~n", [Lead, ekafka_util:get_conf(brokers)]),
+            undefined;
+        {Lead, {Host, Port}} ->
+            case gen_tcp:connect(Host, Port, ekafka_util:get_tcp_options()) of
+                {ok, Sock} ->
+                    {ok, Sock};
+                {error, Reason} ->
+                    ?ERROR("[W] connect to broker ~p failed~n", [Host]),
+                    undefined
+            end
+    end.
+
 get_trace_id(Trace) ->
     case Trace of
         2147483647 -> 0;
@@ -247,7 +296,7 @@ get_trace_id(Trace) ->
 
 handle_server_errors(Error) ->
     %%TODO: check error code when broker changed
-    ?ERROR("[W] server error ~p [~p]", [Error, ekafka_util:get_error_message(Error)]).
+    ?ERROR("[W] server error ~p [~p]~n", [Error, ekafka_util:get_error_message(Error)]).
 
 query_response_api(Dict, CorrId) ->
     case dict:find(CorrId, Dict) of
@@ -269,13 +318,13 @@ send_request(Sock, {Type, From, Worker, Trace, Request}) ->
     {API, Bin} = ekafka_protocol:encode_request(Trace, Worker, Request),
     case gen_tcp:send(Sock, Bin) of
         {error, Reason} ->
-            ?ERROR("[W] ~p send to server failed, ~p", [Worker, Reason]),
+            ?ERROR("[W] ~p send to server failed, ~p~n", [Worker, Reason]),
             erlang:send(Worker, {request_failed, Type, From, Reason});
         ok ->
             erlang:send(Worker, {request_sent, Type, From, Trace, API})
     end.
 
-handle_produce(Name, #metadata_res_partition{id = ID}, KVList) ->
+handle_produce(Name, #partition{id = ID}, KVList) ->
     Messages =
         lists:foldr(fun({Key, Value}, L) ->
             Body = #message_body{key = Key, value = Value},
@@ -285,15 +334,30 @@ handle_produce(Name, #metadata_res_partition{id = ID}, KVList) ->
     Topic = #produce_req_topic{name = Name, partitions = [Partition]},
     #produce_request{topics = [Topic]}.
 
-handle_produce_response(Type, From, _Response) ->
-    case Type of
-        sync ->
-            gen_server:reply(From, ok);
-        async ->
-            ok
+handle_produce_response(Type, From, #produce_response{topics = [#produce_res_topic{name = Name, partitions = [Partition]}]}) ->
+    #produce_res_partition{id = ID, error = Error, offset = Offset} = Partition,
+    ?DEBUG("[W] got produce response, topic: ~p, partition: ~p, error: ~p, offset: ~p~n", [Name, ID, Error, Offset]),
+    case Error of
+        ?NO_ERROR ->
+            case Type of
+                sync ->
+                    gen_server:reply(From, ok);
+                async ->
+                    %% TODO: for async response
+                    ok
+            end;
+        _ ->
+            ?ERROR("[W] produce server error, topic: ~p, partition: ~p, error: ~p~n", [Name, ID, Error]),
+            case Type of
+                sync ->
+                    gen_server:reply(From, {error, Error});
+                async ->
+                    %% TODO: for async response
+                    ok
+            end
     end.
 
-handle_consume(Name, #metadata_res_partition{id = ID}, Offset) ->
+handle_consume(Name, #partition{id = ID}, Offset) ->
     Partition = #fetch_req_partition{id = ID, offset = Offset, max_bytes = ekafka_util:get_max_message_size()},
     Topic = #fetch_req_topic{name = Name, partitions = [Partition]},
     #fetch_request{topics = [Topic]}.
@@ -310,14 +374,14 @@ handle_consume_response(Type, From, #fetch_response{topics = Topics}) ->
                     [#fetch_res_partition{id = ID, error = Error, message_set = Messages}] ->
                         case Error of
                             ?NO_ERROR ->
-                                lists:foldr(fun(#message{offset = Offset, body = #message_body{key = Key, value = Value}}, {M, L}) ->
-                                    Max =
+                                lists:foldr(fun(#message{offset = Offset, body = #message_body{key = Key, value = Value}}, {M1, L}) ->
+                                    M2 =
                                         if
-                                            Offset > M -> Offset;
-                                            true       -> M
+                                            Offset > M1 -> Offset;
+                                            true        -> M1
                                         end,
-                                    [{{ID, Offset}, {Key, Value}} | L]
-                                end, {Max, []}, Messages);
+                                    {M2, [{{ID, Offset}, {Key, Value}} | L]}
+                                end, {0, []}, Messages);
                             _ ->
                                 handle_server_errors(Error),
                                 {0, []}

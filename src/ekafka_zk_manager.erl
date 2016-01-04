@@ -84,6 +84,19 @@ init({Topic, Role, Group}) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
     {stop, Reason :: term(), NewState :: #state{}}).
+handle_call({pick_worker, Key}, _From, #state{workers = Workers} = State) ->
+    case {ekafka_util:get_partition_assignment(), Key} of
+        {true, undefined} ->
+            {reply, {error, error_invalid_key}, State};
+        {true, _} ->
+            PartID = erlang:phash2(Key, erlang:length(Workers)),
+            {PartID, [Pid1 | Tail1]} = lists:keyfind(PartID, 1, Workers),
+            NewWorkers = lists:keyreplace(PartID, 1, Workers, {PartID, Tail1 ++ [Pid1]}),
+            {reply, {ok, Pid1}, State#state{workers = NewWorkers}};
+        _ ->
+            [{ID2, [Pid2 | Tail2]} | Others] = Workers,
+            {reply, {ok, Pid2}, State#state{workers = Others ++ [{ID2, Tail2 ++ [Pid2]}]}}
+    end;
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -116,16 +129,20 @@ handle_cast(_Request, State) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
 handle_info(start_worker_sup, #state{topic = Name} = State) ->
+    ?DEBUG("[MGR] starting topic ~p worker supervisor~n", [Name]),
     {ok, Pid} = ekafka_topic_sup:start_worker_sup(Name),
     erlang:send(self(), get_topic_metadata),
     {noreply, State#state{sup = Pid}};
 handle_info(get_topic_metadata, #state{topic = Name} = State) ->
+    ?DEBUG("[MGR] get_topic_metadata() for topic ~p~n", [Name]),
     ZKConf = ekafka_util:get_conf(zookeeper),
     {ok, Pid} = ezk:start_connection(ZKConf),
     case get_partition_list(Pid, Name) of
         [] ->
+            ?ERROR("[MGR] zookeeper error", []),
             {stop, error_zookeeper_error, State};
         Partitions ->
+            ?DEBUG("[MGR] topic ~p metadata, partitions: ~p~n", [Name, Partitions]),
             erlang:send(self(), start_offset_mgr),
             {noreply, State#state{zk = Pid, partitions = Partitions}}
     end;
@@ -140,6 +157,7 @@ handle_info(start_offset_mgr, #state{topic = Name, group = Group, partitions = P
     {noreply, State};
 handle_info(start_workers, #state{sup = Sup, topic = Name, partitions = Partitions, role = Role} = State) ->
     Max = ekafka_util:get_worker_process_count(Role),
+    ?DEBUG("[MGR] starting workers for topic ~p, count: ~p, role: ~p~n", [Name, Max, Role]),
     Workers =
         lists:foldl(fun(#partition{id = ID} = Partition, L1) ->
             PartWorkers =
@@ -205,15 +223,22 @@ get_partitions(Pid, Name, PartitionIDs) ->
                 L;
             {ok, {Bin,_}} ->
                 Bin1 = binary:replace(Bin, [<<"{">>, <<"}">>, <<"\"">>], <<>>, [global]),
-                Leader =
-                    lists:foldl(fun(Bin2, LeadID) ->
+                {Leader, Isr} =
+                    lists:foldl(fun(Bin2, {LeadID, Is}) ->
                         case Bin2 of
                             <<"leader:", IDBin/binary>> ->
-                                ekafka_util:to_integer(IDBin);
+                                {ekafka_util:to_integer(IDBin), Is};
+                            <<"isr:", ISRBin/binary>> ->
+                                {LeadID, get_isr_list(ISRBin)};
                             _ ->
-                                LeadID
+                                {LeadID, Is}
                         end
-                    end, 0, binary:split(Bin1, <<",">>, [global, trim_all])),
-                [#partition{id = ID, lead = Leader, isr = []} | L]
+                    end, {0, []}, binary:split(Bin1, <<",">>, [global, trim_all])),
+                [#partition{id = ekafka_util:to_integer(ID), lead = Leader, isr = Isr} | L]
         end
     end, [], PartitionIDs).
+
+get_isr_list(Bin) ->
+    lists:foldr(fun(ID, L) ->
+        [ekafka_util:to_integer(ID) | L]
+    end, [], binary:split(Bin, [<<",">>, <<"[">>, <<"]">>], [global, trim_all])).

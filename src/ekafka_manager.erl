@@ -84,14 +84,18 @@ init({Name, Role, Group}) ->
     {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
     {stop, Reason :: term(), NewState :: #state{}}).
 handle_call({pick_worker, Key}, _From, #state{workers = Workers} = State) ->
-    case Key of
-        undefined ->
-            [{ID1, [Pid1 | Others]} | T1] = Workers,
-            {reply, {ok, Pid1}, State#state{workers = T1 ++ [{ID1, Others ++ [Pid1]}]}};
-        _ ->
+    case {ekafka_util:get_partition_assignment(), Key} of
+        {true, undefined} ->
+            {reply, {error, error_invalid_key}, State};
+        {true, _} ->
             PartID = erlang:phash2(Key, erlang:length(Workers)),
-    end,
-    {reply, {ok, Pid}, State};
+            {PartID, [Pid1 | Tail1]} = lists:keyfind(PartID, 1, Workers),
+            NewWorkers = lists:keyreplace(PartID, 1, Workers, {PartID, Tail1 ++ [Pid1]}),
+            {reply, {ok, Pid1}, State#state{workers = NewWorkers}};
+        _ ->
+            [{ID2, [Pid2 | Tail2]} | Others] = Workers,
+            {reply, {ok, Pid2}, State#state{workers = Others ++ [{ID2, Tail2 ++ [Pid2]}]}}
+    end;
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -124,20 +128,25 @@ handle_cast(_Request, State) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
 handle_info(start_worker_sup, #state{topic = Name} = State) ->
+    ?DEBUG("[MGR] starting topic ~p worker supervisor~n", [Name]),
     {ok, Pid} = ekafka_topic_sup:start_worker_sup(Name),
     erlang:send(self(), get_topic_metadata),
     {noreply, State#state{sup = Pid}};
 handle_info(get_topic_metadata, #state{topic = Name} = State) ->
+    ?DEBUG("[MGR] get_topic_metadata() for topic ~p~n", [Name]),
     case get_topic_metadata(Name) of
         undefined ->
             {stop, error_socket_error, State};
-        {?NO_ERROR, _Brokers, Partitions} ->
+        {?NO_ERROR, Brokers, Partitions} ->
+            ?DEBUG("[MGR] topic ~p metadata, brokers: ~p, partitions: ~p~n", [Name, Brokers, Partitions]),
             erlang:send(self(), start_offset_mgr),
             {noreply, State#state{partitions = Partitions}};
         {?UNKNOWN, undefined} ->
+            ?WARNING("[MGR] partition leaders might be in election, retry 5 secs later~n", []),
             erlang:send_after(5000, self(), get_topic_metadata),
             {noreply, State};
-        {_, undefined} ->
+        {Error, undefined} ->
+            ?ERROR("[MGR] get topic ~p metadata failed ~p, ~p~n", [Name, Error, ekafka_util:get_error_message(Error)]),
             {stop, error_kafka_server_error, State}
     end;
 handle_info(start_offset_mgr, #state{topic = Name, group = Group, partitions = Partitions, role = Role} = State) ->
@@ -151,6 +160,7 @@ handle_info(start_offset_mgr, #state{topic = Name, group = Group, partitions = P
     {noreply, State};
 handle_info(start_workers, #state{sup = Sup, topic = Name, partitions = Partitions, role = Role} = State) ->
     Max = ekafka_util:get_worker_process_count(Role),
+    ?DEBUG("[MGR] starting workers for topic ~p, count: ~p, role: ~p~n", [Name, Max, Role]),
     Workers =
         lists:foldl(fun(#partition{id = ID} = Partition, L1) ->
             PartWorkers =
@@ -226,14 +236,14 @@ get_topic_metadata(Name) ->
                         ?NO_ERROR ->
                             {?NO_ERROR, Brokers, to_partitions(Partitions)};
                         ?UNKNOWN ->
-                            ?INFO("[MGR] broker lead is in election, try later", []),
+                            ?INFO("[MGR] broker lead is in election, try later~n", []),
                             {?UNKNOWN, undefined};
                         _ ->
-                            ?ERROR("[MGR] Kafka response error: ~p", [ekafka_util:get_error_message(E1)]),
+                            ?ERROR("[MGR] Kafka response error: ~p~n", [ekafka_util:get_error_message(E1)]),
                             {Err, undefined}
                     end;
                 _ ->
-                    ?ERROR("[MGR] Kafka response error: ~p", [ekafka_util:get_error_message(E1)]),
+                    ?ERROR("[MGR] Kafka response error: ~p~n", [ekafka_util:get_error_message(E1)]),
                     {E1, undefined}
             end
     end.
@@ -241,7 +251,7 @@ get_topic_metadata(Name) ->
 request_topic_metadata({IP, Port} = Host, Name) ->
     case gen_tcp:connect(IP, Port, ekafka_util:get_tcp_options()) of
         {error, Reason} ->
-            ?ERROR("[MGR] connect to broker ~p error: ~p", [Host, Reason]),
+            ?ERROR("[MGR] connect to broker ~p error: ~p~n", [Host, Reason]),
             undefined;
         {ok, Sock} ->
             Request = #metadata_request{topics = [Name]},

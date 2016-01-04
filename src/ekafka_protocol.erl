@@ -66,11 +66,9 @@ encode_request(TraceID, Client, Request) ->
                 {-1, undefined}
         end,
     ClientBin = encode_string(ekafka_util:to_list(Client)),
-    Bin = <<API:16/?INT, Ver:16/?INT, TraceID:32/?INT, ClientBin/binary, ReqBin/binary>>,
-    Size = erlang:size(Bin),
-    {API, <<Size:32/?INT, Bin/binary>>}.
+    {API, <<API:16/?INT, Ver:16/?INT, TraceID:32/?INT, ClientBin/binary, ReqBin/binary>>}.
 
--spec decode_response({M,F,A}, In :: binary()) ->
+-spec decode_response(Args :: any(), In :: binary()) ->
     {CorrId :: int32(), Response :: undefined                     |
                                     #metadata_response{}          |
                                     #produce_response{}           |
@@ -174,12 +172,16 @@ encode_message(#message{offset = Offset, body = #message_body{magic = Magic, att
     Size = erlang:size(BodyBin) + 4,
     <<Offset:64/?INT, Size:32/?INT, CRC:32/?INT, BodyBin/binary>>.
 
+%% WARN: message set cannot be encoded as array!!!
 encode_message_set(#message_set{messages = Messages}) ->
-    MessagesBinL =
-        lists:foldr(fun(Message, L) ->
-            [encode_message(Message) | L]
-        end, [], Messages),
-    encode_array(MessagesBinL).
+%%    MessagesBinL =
+%%        lists:foldr(fun(Message, L) ->
+%%            [encode_message(Message) | L]
+%%        end, [], Messages),
+%%    encode_array(MessagesBinL).
+    lists:foldr(fun(Message, Bin) ->
+        <<(encode_message(Message))/binary, Bin/binary>>
+    end, <<>>, Messages).
 
 encode_topic(#topic{name = Name, partitions = Partitions}) ->
     NameBin = encode_string(Name),
@@ -316,7 +318,7 @@ encode_sync_group_request(#sync_group_request{id = ID, generation = Gen, member_
     MemberBin = encode_string(Member),
     AssignsBinL =
         lists:foldr(fun(Assignment, L) ->
-            [sync_group_req_assignment(Assignment) | L]
+            [encode_sync_group_req_assignment(Assignment) | L]
         end, [], Assigns),
     AssignsBin = encode_array(AssignsBinL),
     <<IDBin/binary, Gen:32/?INT, MemberBin/binary, AssignsBin/binary>>.

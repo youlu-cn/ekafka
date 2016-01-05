@@ -265,9 +265,27 @@ encode_offset_req_partition(#offset_req_partition{id = ID, time = Time, max_num 
 encode_group_coordinator_request(#group_coordinator_request{id = GroupID}) ->
     encode_string(GroupID).
 
-%% TODO:
-encode_offset_commit_request(#offset_commit_request{}) ->
-    ok.
+encode_offset_commit_request(#offset_commit_request{group_id = GroupID, topics = Topics}) ->
+    GroupBin = encode_string(GroupID),
+    TopicsBinL =
+        lists:foldr(fun(Topic, L) ->
+            [encode_offset_commit_req_topic(Topic) | L]
+        end, [], Topics),
+    TopicsBin = encode_array(TopicsBinL),
+    <<GroupBin/binary, TopicsBin/binary>>.
+
+encode_offset_commit_req_topic(#offset_commit_req_topic{name = Name, partitions = Partitions}) ->
+    NameBin = encode_string(Name),
+    PartitionsBinL =
+        lists:foldr(fun(Partition, L) ->
+            [encode_offset_commit_req_partition(Partition) | L]
+        end, [], Partitions),
+    PartitionsBin = encode_array(PartitionsBinL),
+    <<NameBin/binary, PartitionsBin/binary>>.
+
+encode_offset_commit_req_partition(#offset_commit_req_partition{id = ID, offset = Offset, metadata = Metadata}) ->
+    MetadataBin = encode_string(Metadata),
+    <<ID:32/?INT, Offset:64/?INT, MetadataBin/binary>>.
 
 encode_offset_fetch_request(#offset_fetch_request{group_id = GroupID, topics = Topics}) ->
     GroupBin = encode_string(GroupID),

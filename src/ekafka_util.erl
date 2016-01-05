@@ -175,6 +175,13 @@ get_partition_assignment() ->
         Value     -> Value
     end.
 
+get_offset_auto_commit_timeout() ->
+    case get_conf(auto_commit_timeout) of
+        undefined -> 30000;
+        Value     -> Value
+    end.
+
+
 send_to_server_sync(Sock, Request) ->
     Random = random:uniform(2000000000),
     {API, Bin} = ekafka_protocol:encode_request(Random, "sync_client", Request),

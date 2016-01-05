@@ -84,14 +84,11 @@ init({Topic, Group, Partitions}) ->
     {stop, Reason :: term(), NewState :: #state{}}).
 handle_call({get_partition_offset, PartID}, _From, #state{offsets = Offsets} = State) ->
     Offset =
-        case lists:keyfind(PartID, 2, Offsets) of
+        case lists:keyfind(PartID, 1, Offsets) of
             false ->
                 -1;
-            #offset_fetch_res_partition{offset = R} ->
-                case R of
-                    -1 -> 0;
-                    V  -> V
-                end
+            {PartID, R} ->
+                R
         end,
     {reply, {ok, Offset}, State};
 handle_call(_Request, _From, State) ->
@@ -108,17 +105,15 @@ handle_call(_Request, _From, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
-handle_cast({message_consumed, PartID, Offset}, #state{partitions = Partitions} = State) ->
-    NewPartitions =
-        lists:foldr(fun(#partition{id = ID} = Partition, L) ->
-            case ID of
-                PartID ->
-                    [Partition#partition{offset = Offset} | L];
-                _ ->
-                    [Partition | L]
-            end
-        end, [], Partitions),
-    {noreply, State#state{partitions = NewPartitions}};
+handle_cast({message_consumed, PartID, Offset}, #state{offsets = Offsets} = State) ->
+    case lists:keyfind(PartID, 1, Offsets) of
+        false ->
+            ?ERROR("[O] invalid partition id: ~p~n", [PartID]),
+            {noreply, State};
+        _ ->
+            NewOffsets = lists:keyreplace(PartID, 1, {PartID, Offset}, Offsets),
+            {noreply, State#state{offsets = NewOffsets}}
+    end;
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -147,14 +142,32 @@ handle_info(start_connection, #state{group = Group} = State) ->
     end;
 handle_info(sync_consume_offset, #state{group = Group, topic = Name, partitions = Partitions, sock = Sock} = State) ->
     Request = request_fetch_offset(Group, Name, Partitions),
+    erlang:send_after(ekafka_util:get_offset_auto_commit_timeout(), self(), auto_commit_offset),
     case ekafka_util:send_to_server_sync(Sock, Request) of
         undefined ->
             ?ERROR("[O] fetch offset error~n", []),
             {noreply, State};
-        #offset_fetch_response{topics = [#offset_fetch_res_topic{partitions = PartOffset}]} ->
-            ?DEBUG("[O] sync offset over, topic: ~p, offset: ~p~n", [Name, PartOffset]),
-            {noreply, State#state{offsets = PartOffset}}
+        #offset_fetch_response{topics = [#offset_fetch_res_topic{partitions = PartOffsets}]} ->
+            {Offsets, NewPartitions} =
+                lists:foldl(fun(#offset_fetch_res_partition{id = ID, offset = Ost}, {L1, L2}) ->
+                    Partition = lists:keyfind(ID, 2, Partitions),
+                    {[{ID, Ost} | L1], [Partition#partition{offset = Ost} | L2]}
+                end, {[], []}, PartOffsets),
+            ?DEBUG("[O] sync offset over, topic: ~p, offset: ~p~n", [Name, Offsets]),
+            {noreply, State#state{offsets = Offsets, partitions = NewPartitions}}
     end;
+handle_info(auto_commit_offset, #state{group = Group, topic = Name, partitions = Partitions, offsets = Offsets, sock = Sock} = State) ->
+    NewPartitions =
+        lists:foldl(fun(#partition{id = PartID, offset = Offset} = Partition, L) ->
+            case lists:keyfind(PartID, 1, Offsets) of
+                {PartID, Offset} ->
+                    [Partition | L];
+                {PartID, NewOffset} ->
+                    commit_offset(Sock, Name, Group, PartID, NewOffset),
+                    [Partition#partition{offset = NewOffset} | L]
+            end
+        end, [], Partitions),
+    {noreply, State#state{partitions = NewPartitions}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -230,3 +243,14 @@ request_fetch_offset(Group, Topic, Parts) ->
             [ID | L]
         end, [], Parts),
     #offset_fetch_request{group_id = Group, topics = [#offset_fetch_req_topic{name = Topic, partitions = Partitions}]}.
+
+commit_offset(Sock, Name, Group, PartID, Offset) ->
+    Partition = #offset_commit_req_partition{id = PartID, offset = Offset},
+    Topic = #offset_commit_req_topic{name = Name, partitions = [Partition]},
+    Request = #offset_commit_request{group_id = Group, topics = [Topic]},
+    case ekafka_util:send_to_server_sync(Sock, Request) of
+        undefined ->
+            ?ERROR("[O] commit offset failed, ~p:~p~n", [Name, PartID]);
+        #offset_commit_response{} ->
+            ?DEBUG("[O] offset committed~n", [])
+    end.

@@ -66,7 +66,7 @@ start_link(Topic, Role, Group) ->
     {ok, State :: #state{}} | {ok, State :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term()} | ignore).
 init({Topic, Role, Group}) ->
-    erlang:send(self(), start_worker_sup),
+    erlang:send(self(), start_connection),
     {ok, #state{topic = Topic, role = Role, group = Group}}.
 
 %%--------------------------------------------------------------------
@@ -147,23 +147,36 @@ handle_cast(_Request, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
+handle_info(start_connection, State) ->
+    ZKConf = ekafka_util:get_conf(zookeeper),
+    {ok, Pid} = ezk:start_connection(ZKConf),
+    erlang:send(self(), start_worker_sup),
+    {noreply, State#state{zk = Pid}};
 handle_info(start_worker_sup, #state{topic = Name} = State) ->
     ?DEBUG("[MGR] starting topic ~p worker supervisor~n", [Name]),
     {ok, Pid} = ekafka_topic_sup:start_worker_sup(Name),
     erlang:send(self(), get_topic_metadata),
     {noreply, State#state{sup = Pid}};
-handle_info(get_topic_metadata, #state{topic = Name} = State) ->
+handle_info(get_topic_metadata, #state{topic = Name, zk = Pid} = State) ->
     ?DEBUG("[MGR] get_topic_metadata() for topic ~p~n", [Name]),
-    ZKConf = ekafka_util:get_conf(zookeeper),
-    {ok, Pid} = ezk:start_connection(ZKConf),
     case get_partition_list(Pid, Name) of
+        undefined ->
+            ?INFO("[MGR] topic ~p not created, creating...~n", [Name]),
+            case create_topic(Name) of
+                undefined ->
+                    ?INFO("[MGR] failed to create topic ~p~n", [Name]),
+                    {stop, error_broker_error, State};
+                _ ->
+                    erlang:send_after(5000, self(), get_topic_metadata),
+                    {noreply, State}
+            end;
         [] ->
             ?ERROR("[MGR] zookeeper error", []),
             {stop, error_zookeeper_error, State};
         Partitions ->
             ?DEBUG("[MGR] topic ~p metadata, partitions: ~p~n", [Name, Partitions]),
             erlang:send(self(), start_offset_mgr),
-            {noreply, State#state{zk = Pid, partitions = Partitions}}
+            {noreply, State#state{partitions = Partitions}}
     end;
 handle_info(start_offset_mgr, #state{topic = Name, group = Group, partitions = Partitions, role = Role} = State) ->
     case Role of
@@ -227,6 +240,8 @@ code_change(_OldVsn, State, _Extra) ->
 get_partition_list(Pid, Topic) ->
     Path = lists:concat(["/brokers/topics/", Topic, "/partitions"]),
     case ezk:ls(Pid, Path) of
+        {error, no_dir} ->
+            undefined;
         {error, _Error} ->
             [];
         {ok, IDList} ->
@@ -242,22 +257,40 @@ get_partitions(Pid, Name, PartitionIDs) ->
                 L;
             {ok, {Bin,_}} ->
                 Bin1 = binary:replace(Bin, [<<"{">>, <<"}">>, <<"\"">>], <<>>, [global]),
-                {Leader, Isr} =
-                    lists:foldl(fun(Bin2, {LeadID, Is}) ->
+                Leader =
+                    lists:foldl(fun(Bin2, LeadID) ->
                         case Bin2 of
                             <<"leader:", IDBin/binary>> ->
-                                {ekafka_util:to_integer(IDBin), Is};
-                            <<"isr:", ISRBin/binary>> ->
-                                {LeadID, get_isr_list(ISRBin)};
+                                ekafka_util:to_integer(IDBin);
                             _ ->
-                                {LeadID, Is}
+                                LeadID
                         end
-                    end, {0, []}, binary:split(Bin1, <<",">>, [global, trim_all])),
-                [#partition{id = ekafka_util:to_integer(ID), lead = Leader, isr = Isr} | L]
+                    end, 0, binary:split(Bin1, <<",">>, [global, trim_all])),
+                [#partition{id = ekafka_util:to_integer(ID), lead = Leader, isr = get_isr_list(Bin1)} | L]
         end
     end, [], PartitionIDs).
 
 get_isr_list(Bin) ->
+    [_H, T] = binary:split(Bin, <<"isr:">>),
+    [IsrBinL|_] = binary:split(T, [<<"[">>, <<"]">>], [global, trim_all]),
     lists:foldr(fun(ID, L) ->
         [ekafka_util:to_integer(ID) | L]
-    end, [], binary:split(Bin, [<<",">>, <<"[">>, <<"]">>], [global, trim_all])).
+    end, [], binary:split(IsrBinL, <<",">>, [global, trim_all])).
+
+create_topic(Name) ->
+    [{_,{IP, Port}}|_T] = ekafka_util:get_conf(brokers),
+    case gen_tcp:connect(IP, Port, ekafka_util:get_tcp_options()) of
+        {error, Reason} ->
+            ?ERROR("[MGR] connect to broker ~p error: ~p~n", [IP, Reason]),
+            undefined;
+        {ok, Sock} ->
+            Request = #metadata_request{topics = [Name]},
+            Res = ekafka_util:send_to_server_sync(Sock, Request),
+            gen_tcp:close(Sock),
+            case Res of
+                #metadata_response{} ->
+                    ok;
+                _ ->
+                    undefined
+            end
+    end.

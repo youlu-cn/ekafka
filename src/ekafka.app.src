@@ -24,6 +24,7 @@
             {produce_workers, 8},
             {hash_partition_by_key, true},
             %% for consumer
+            {auto_commit_timeout, 30000},
             {consume_from_beginning, true},
             {max_message_bytes, 1048576}
         ]

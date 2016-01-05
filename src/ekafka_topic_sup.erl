@@ -16,6 +16,8 @@
 %% API
 -export([start_link/3, start_worker_sup/1, start_offset_manager/3]).
 
+-export([produce/3]).
+
 %% Supervisor callbacks
 -export([init/1]).
 
@@ -64,6 +66,16 @@ start_offset_manager(Topic, Group, Partitions) ->
         end,
 
     supervisor:start_child(ekafka_util:get_topic_supervisor_name(Topic), OffsetMgrSpec).
+
+-spec produce(Type :: sync | async, Topic :: string(), KV :: list(tuple())) ->
+    {error, any()} | ok.
+produce(Type, Topic, [{Key, _V}|_] = KVList) ->
+    case gen_server:call(ekafka_util:get_topic_manager_name(Topic), {pick_produce_worker, Key}) of
+        {ok, Pid} ->
+            gen_server:call(Pid, {produce, Type, KVList});
+        {error, Error} ->
+            {error, Error}
+    end.
 
 %%%===================================================================
 %%% Supervisor callbacks

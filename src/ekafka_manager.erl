@@ -160,8 +160,8 @@ handle_info(get_topic_metadata, #state{topic = Name} = State) ->
             ?DEBUG("[MGR] topic ~p metadata, brokers: ~p, partitions: ~p~n", [Name, Brokers, Partitions]),
             erlang:send(self(), start_offset_mgr),
             {noreply, State#state{partitions = Partitions}};
-        {?UNKNOWN, undefined} ->
-            ?WARNING("[MGR] partition leaders might be in election, retry 5 secs later~n", []),
+        {?LEADER_NOT_AVAILABLE, undefined} ->
+            ?WARNING("[MGR] partition leader is in election, retry 5 secs later~n", []),
             erlang:send_after(5000, self(), get_topic_metadata),
             {noreply, State};
         {Error, undefined} ->
@@ -254,9 +254,6 @@ get_topic_metadata(Name) ->
                     case Err of
                         ?NO_ERROR ->
                             {?NO_ERROR, Brokers, to_partitions(Partitions)};
-                        ?UNKNOWN ->
-                            ?INFO("[MGR] broker lead is in election, try later~n", []),
-                            {?UNKNOWN, undefined};
                         _ ->
                             ?ERROR("[MGR] Kafka response error: ~p~n", [ekafka_util:get_error_message(E1)]),
                             {Err, undefined}

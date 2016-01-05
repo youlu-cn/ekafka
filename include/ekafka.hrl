@@ -32,10 +32,10 @@
 -define(EKAFKA_CONF, ekafka_conf).
 -record(ekafka_conf, {key, value}).
 
--record(partition, {id      :: int32(),
-                    lead    :: int32(),
-                    offset  :: int64(),
-                    isr     :: list(int32())}).
+-record(partition, {id         :: int32(),
+                    lead       :: int32(),
+                    offset = 0 :: int64(),
+                    isr        :: list(int32())}).
 
 
 -define(INT, signed-integer).
@@ -313,8 +313,15 @@
 
 
 %% Offset Commit Request
-%%TODO:
--record(offset_commit_request, {}).
+-record(offset_commit_req_partition, {id      :: int32(),
+                                      offset  :: int64(),
+                                      metadata:: string()}).
+
+-record(offset_commit_req_topic, {name        :: topic_name(),
+                                  partitions  :: list(#offset_commit_req_partition{})}).
+
+-record(offset_commit_request, {group_id      :: group_id(),
+                                topics        :: list(#offset_commit_req_topic{})}).
 
 %% Offset Commit Response
 -record(offset_commit_res_partition, {id      :: partition_id(),

@@ -222,9 +222,13 @@ handle_info({response_received, CorrId, Response}, #state{topic = Name, dict = D
             handle_produce_response(Type, From, Response),
             {noreply, State#state{dict = dict:erase(CorrId, Dict)}};
         #fetch_response{} ->
-            Consumed = handle_consume_response(Type, From, Response),
-            handle_message_consumed(Name, PartID, Consumed),
-            {noreply, State#state{dict = dict:erase(CorrId, Dict), offset = Consumed}};
+            case handle_consume_response(Type, From, Response) of
+                0 ->
+                    {noreply, State#state{dict = dict:erase(CorrId, Dict)}};
+                Offset ->
+                    handle_message_consumed(Name, PartID, Offset + 1),
+                    {noreply, State#state{dict = dict:erase(CorrId, Dict), offset = Offset + 1}}
+            end;
         _ ->
             {stop, error_unknown_response, State}
     end;

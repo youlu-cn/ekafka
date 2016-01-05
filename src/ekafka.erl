@@ -54,13 +54,8 @@ add_producer(Topic) ->
     {error, any()} | ok.
 produce(Topic, {Key, Value}) ->
     produce(Topic, [{Key, Value}]);
-produce(Topic, [{Key, _V}|_] = KVList) ->
-    case gen_server:call(ekafka_util:get_topic_manager_name(Topic), {pick_produce_worker, Key}) of
-        {ok, Pid} ->
-            gen_server:call(Pid, {produce, sync, KVList});
-        {error, Error} ->
-            {error, Error}
-    end.
+produce(Topic, KVList) ->
+    ekafka_topic_sup:produce(sync, Topic, KVList).
 
 -spec add_consumer(Topic :: string(), Group :: string()) ->
     ok.

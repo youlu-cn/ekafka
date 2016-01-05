@@ -24,10 +24,11 @@
     terminate/2,
     code_change/3]).
 
--record(state, {topic       :: string(),
-                group       :: string(),
-                partitions  :: [#partition{}],
-                zk          :: pid()}).
+-record(state, {topic           :: string(),
+                group           :: string(),
+                partitions      :: [#partition{}],
+                offsets    = [] :: [{int32(), int64()}],
+                zk              :: pid()}).
 
 %%%===================================================================
 %%% API
@@ -81,6 +82,15 @@ init({Topic, Group, Partitions}) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
     {stop, Reason :: term(), NewState :: #state{}}).
+handle_call({get_partition_offset, PartID}, _From, #state{offsets = Offsets} = State) ->
+    Offset =
+        case lists:keyfind(PartID, 1, Offsets) of
+            false ->
+                -1;
+            {PartID, R} ->
+                R
+        end,
+    {reply, {ok, Offset}, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -95,6 +105,15 @@ handle_call(_Request, _From, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
+handle_cast({message_consumed, PartID, Offset}, #state{offsets = Offsets} = State) ->
+    case lists:keyfind(PartID, 1, Offsets) of
+        false ->
+            ?ERROR("[O] invalid partition id: ~p~n", [PartID]),
+            {noreply, State};
+        _ ->
+            NewOffsets = lists:keyreplace(PartID, 1, {PartID, Offset}, Offsets),
+            {noreply, State#state{offsets = NewOffsets}}
+    end;
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -117,8 +136,31 @@ handle_info(start_connection, State) ->
     {ok, Pid} = ezk:start_connection(ZKConf),
     erlang:send(self(), sync_consume_offset),
     {noreply, State#state{zk = Pid}};
-handle_info(sync_consume_offset, State) ->
-    {noreply, State};
+handle_info(sync_consume_offset, #state{group = Group, topic = Name, partitions = Partitions, zk = Pid} = State) ->
+    {Offsets, NewPartitions} =
+        lists:foldl(fun(#partition{id = PartID} = Partition, {L1, L2}) ->
+            Path = lists:concat(["/consumers/", Group, "/offsets/", Name, "/", PartID]),
+            case ezk:get(Pid, Path) of
+                {ok, {Offset, _}} ->
+                    {[{PartID, Offset} | L1], [Partition#partition{offset = ekafka_util:to_integer(Offset)} | L2]};
+                _ ->
+                    {[{PartID, 0} | L1], [Partition | L2]}
+            end
+        end, {[], []}, Partitions),
+    erlang:send_after(ekafka_util:get_offset_auto_commit_timeout(), self(), auto_commit_offset),
+    {noreply, State#state{offsets = Offsets, partitions = NewPartitions}};
+handle_info(auto_commit_offset, #state{topic = Name, group = Group, zk = Pid, partitions = Partitions, offsets = Offsets} = State) ->
+    NewPartitions =
+        lists:foldl(fun(#partition{id = PartID, offset = Offset} = Partition, L) ->
+            case lists:keyfind(PartID, 1, Offsets) of
+                {PartID, Offset} ->
+                    [Partition | L];
+                {PartID, NewOffset} ->
+                    commit_offset(Pid, Name, Group, PartID, NewOffset),
+                    [Partition#partition{offset = NewOffset} | L]
+            end
+        end, [], Partitions),
+    {noreply, State#state{partitions = NewPartitions}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -155,3 +197,14 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+commit_offset(Pid, Name, Group, PartID, Offset) ->
+    Path = lists:concat(["/consumers/", Group, "/offsets/", Name, "/", PartID]),
+    case ezk:set(Pid, Path, ekafka_util:to_binary(Offset)) of
+        {ok, _} ->
+            ?DEBUG("[O] offset commited~n", []);
+        {error, no_dir} ->
+            ?DEBUG("[O] create node for group: ~p, topic: ~p, partition:~p~n", [Group, Name, PartID]),
+            ezk:create(Pid, Path, ekafka_util:to_binary(Offset));
+        Error ->
+            ?ERROR("[O] commit offset failed ~p, ~p:~p~n", [Error, Name, PartID])
+    end.

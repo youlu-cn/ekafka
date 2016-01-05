@@ -34,7 +34,7 @@
                 role,
                 trace_id,
                 dict           :: dict:dict(int32(), #request_state{}),
-                offset}).
+                offset     = 0 :: int64()}).
 
 %%%===================================================================
 %%% API
@@ -149,47 +149,51 @@ handle_info(start_connection, #state{topic = Name, partition = #partition{id = I
             ?ERROR("[W] init failed to connect broker, exit..~n", []),
             {stop, broker_not_connected, State};
         {ok, Sock} ->
-            erlang:send_after(5000, self(), sync_offset),
+            erlang:send(self(), init_begin_offset),
             {noreply, State#state{sock = Sock}}
     end;
-handle_info(sync_offset, #state{topic = Name, role = Role, partition = #partition{id = PartID}} = State) ->
+handle_info(init_begin_offset, #state{sock = Sock, topic = Name, role = Role, partition = #partition{id = PartID}} = State) ->
     case Role of
         producer ->
             {noreply, State};
         consumer ->
-            case sync_message_offset(Name, PartID) of
-                {ok, undefined} ->
-                    ?WARNING("[W] still getting offset, try later~n", []),
-                    erlang:send_after(5000, self(), sync_offset),
-                    {noreply, State};
-                {ok, Offset} ->
-                    ?INFO("[W] offset ~p received, ~p:~p~n", [Offset, Name, PartID]),
-                    {noreply, State#state{offset = Offset}}
-            end
+            Offset = get_init_offset(Sock, Name, PartID),
+            erlang:send_after(5000, self(), sync_group_offset),
+            {noreply, State#state{offset = Offset}}
+    end;
+handle_info(sync_group_offset, #state{topic = Name, partition = #partition{id = PartID}, offset = Offset} = State) ->
+    case sync_message_offset(Name, PartID) of
+        Res when Res > Offset ->
+            ?INFO("[W] got group consume offset, ~p:~p, value: ~p~n", [Name, PartID, Res]),
+            {noreply, State#state{offset = Offset}};
+        _ ->
+            {noreply, State}
     end;
 
 %% handle socket
 handle_info({tcp, Sock, Data}, #state{sock = Sock, dict = Dict} = State) ->
-    ?DEBUG("[W] tcp data received, ~p~n", [self()]),
+    ?DEBUG("[W] tcp data received, ~p, ~p~n", [self(), Data]),
     erlang:spawn(?MODULE, decode_response, [{?MODULE, query_response_api, Dict}, self(), Data]),
     {noreply, State};
 handle_info({re_connect, Reason, Times}, #state{topic = Name, partition = #partition{id = ID, lead = Lead}} = State) ->
-    ?DEBUG("[W] reconnecting to broker ~p, reason: ~p, topic: ~p, partition: ~p~n", [Times, Reason, Name, ID]),
+    ?WARNING("[W] ~p reconnecting to broker, reason: ~p, topic: ~p, partition: ~p~n", [Times, Reason, Name, ID]),
     case connect_to_lead_broker(Lead) of
         undefined ->
-            erlang:send_after(5000, self(), {re_connect, Reason, Times + 1}),
+            erlang:send_after(1000, self(), {re_connect, Reason, Times + 1}),
             {noreply, State};
         {ok, Sock} ->
+            ?INFO("[W] broker reconnected, ~p:~p~n", [Name, ID]),
             {noreply, State#state{sock = Sock}}
     end;
 handle_info({tcp_closed, _Sock}, State) ->
     %%TODO: don't assign works before re-connected
-    erlang:send_after(5000, self(), {re_connect, tcp_closed, 1}),
+    ?WARNING("[W] server closed connection, reconnect later~n", []),
+    erlang:send_after(100, self(), {re_connect, tcp_closed, 1}),
     {noreply, State};
 handle_info({tcp_error, _Sock, Reason}, State) ->
     %%TODO: don't assign works before re-connected
-    ?DEBUG("[W] tcp error occurs, ~p~n", [Reason]),
-    erlang:send_after(5000, self(), {re_connect, tcp_error, 1}),
+    ?ERROR("[W] tcp error occurs, ~p, reconnect later~n", [Reason]),
+    erlang:send_after(100, self(), {re_connect, tcp_error, 1}),
     {noreply, State};
 
 %% handle request callback
@@ -283,7 +287,7 @@ connect_to_lead_broker(Lead) ->
                 {ok, Sock} ->
                     {ok, Sock};
                 {error, Reason} ->
-                    ?ERROR("[W] connect to broker ~p failed~n", [Host]),
+                    ?ERROR("[W] connect to broker ~p failed: ~p~n", [Host, Reason]),
                     undefined
             end
     end.
@@ -371,9 +375,10 @@ handle_consume_response(Type, From, #fetch_response{topics = Topics}) ->
                 case Partitions of
                     [] ->
                         {0, []};
-                    [#fetch_res_partition{id = ID, error = Error, message_set = Messages}] ->
+                    [#fetch_res_partition{id = ID, error = Error, message_set = #message_set{messages = Messages}}] ->
                         case Error of
                             ?NO_ERROR ->
+                                ?DEBUG("[W] message set received, ~p~n", [Messages]),
                                 lists:foldr(fun(#message{offset = Offset, body = #message_body{key = Key, value = Value}}, {M1, L}) ->
                                     M2 =
                                         if
@@ -396,8 +401,36 @@ handle_consume_response(Type, From, #fetch_response{topics = Topics}) ->
     end,
     Consumed.
 
-sync_message_offset(Topic, PartID) ->
-    gen_server:call(ekafka_util:get_topic_offset_mgr_name(Topic), {get_partition_offset, PartID}).
+sync_message_offset(Name, PartID) ->
+    case gen_server:call(ekafka_util:get_topic_offset_mgr_name(Name), {get_partition_offset, PartID}) of
+        {ok, Offset} ->
+            Offset;
+        _ ->
+            0
+    end.
+
+get_init_offset(Sock, Name, PartID) ->
+    Time =
+        case ekafka_util:get_conf(consume_from_beginning) of
+            false -> ?REQ_LATEST_OFFSET;
+            _     -> ?REQ_EARLIEST_OFFSET
+        end,
+    Topic = #offset_req_topic{name = Name, partitions = [#offset_req_partition{time = Time, id = PartID}]},
+    Request = #offset_request{topics = [Topic]},
+    case ekafka_util:send_to_server_sync(Sock, Request) of
+        undefined ->
+            0;
+        #offset_response{topics = [#offset_res_topic{partitions = [#offset_res_partition{error = Error, offsets = Offsets}]}]} ->
+            [Offset|_] = Offsets,
+            case Error of
+                ?NO_ERROR ->
+                    ?DEBUG("[W] the begin offset of ~p:~p is ~p~n", [Name, PartID, Offset]),
+                    Offset;
+                _ ->
+                    handle_server_errors(Error),
+                    0
+            end
+    end.
 
 handle_message_consumed(Topic, PartID, Offset) ->
     gen_server:cast(ekafka_util:get_topic_offset_mgr_name(Topic), {message_consumed, PartID, Offset}).

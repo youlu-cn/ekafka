@@ -245,7 +245,7 @@
 -record(fetch_req_topic, {name                :: topic_name(),
                           partitions          :: list(#fetch_req_partition{})}).
 
--record(fetch_request, {%replica               :: int32(), %% should always be -1
+-record(fetch_request, {%replica       = -1    :: int32(), %% should always be -1
                         max_wait      = 100   :: int32(), %% default 100ms
                         mini_bytes    = 32768 :: int32(), %% default 32k
                         topics                :: list(#fetch_req_topic{})}).
@@ -272,20 +272,23 @@
 %%  As with the produce and fetch APIs requests must be directed to the broker that is currently the leader for the partitions in question.
 %%  This can be determined using the metadata API.
 %% Offset Request
+-define(REQ_LATEST_OFFSET, -1).
+-define(REQ_EARLIEST_OFFSET, -2).
+
 -record(offset_req_partition, {id             :: partition_id(),
-                               time           :: int64(),
-                               max_num        :: int32()}).
+                               time      = -2 :: int64(),   %% default for the earliest offset
+                               max_num   = 1  :: int32()}).
 
 -record(offset_req_topic, {name               :: topic_name(),
                            partitions         :: list(#offset_req_partition{})}).
 
--record(offset_request, {replica              :: int32(),
+-record(offset_request, {%replica         = -1 :: int32(),
                          topics               :: list(#offset_req_topic{})}).
 
 %% Offset Response
 -record(offset_res_partition, {id             :: partition_id(),
                                error          :: int16(),
-                               offset         :: int64()}).
+                               offsets        :: list(int64())}).
 
 -record(offset_res_topic, {name               :: topic_name(),
                            partitions         :: list(#offset_res_partition{})}).

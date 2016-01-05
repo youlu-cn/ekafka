@@ -89,7 +89,7 @@ decode_response(Fun, <<CorrId:32/?INT, Data/binary>>) ->
             {M,F,A} -> M:F(A, CorrId);
             _       -> Fun(CorrId)
         end,
-    {Response, Tail} =
+    Response =
         case API of
             ?PRODUCE_REQUEST ->
                 decode_produce_response(Data);
@@ -121,14 +121,7 @@ decode_response(Fun, <<CorrId:32/?INT, Data/binary>>) ->
                 ?ERROR("[PROTO] invalid API key", []),
                 {undefined, <<>>}
         end,
-    case Tail of
-        <<>> ->
-            {CorrId, Response};
-        _ ->
-            %% invalid data
-            ?ERROR("[PROTO] invalid response", []),
-            {CorrId, undefined}
-    end.
+    {CorrId, Response}.
 
 
 %% Variable Length Primitives
@@ -248,11 +241,12 @@ encode_fetch_req_topic(#fetch_req_topic{name = Name, partitions = Partitions}) -
 encode_fetch_req_partition(#fetch_req_partition{id = ID, offset = Offset, max_bytes = MaxBytes}) ->
     <<ID:32/?INT, Offset:64/?INT, MaxBytes:32/?INT>>.
 
-encode_offset_request(#offset_request{replica = Replica, topics = Topics}) ->
+encode_offset_request(#offset_request{topics = Topics}) ->
     TopicsBinL =
         lists:foldr(fun(Topic, L) ->
             [encode_offset_req_topic(Topic) | L]
         end, [], Topics),
+    Replica = -1,
     TopicsBin = encode_array(TopicsBinL),
     <<Replica:32/?INT, TopicsBin/binary>>.
 
@@ -380,26 +374,35 @@ decode_bytes(<<Len:32/?INT, Data/binary>>) ->
             {Bytes, Tail}
     end.
 
-decode_message(<<Offset:64/?INT, Size:32/?INT, Body:Size/binary, Tail/binary>>) ->
-    <<CRC:32/?INT, T1>> = Body,
+decode_message(<<>>, Acc) ->
+    Acc;
+decode_message(<<Offset:64/?INT, Size:32/?INT, Body:Size/binary, Tail/binary>>, Acc) ->
+    <<CRC:32/?INT, T1/binary>> = Body,
+    CRC32 = CRC band 16#FFFFFFFF,
     case erlang:crc32(T1) of
-        CRC ->
-            <<Magic:8/?INT, Attr:8/?INT, T1>> = T1,
-            {Key, T2} = decode_bytes(T1),
-            {Value, <<>>} = decode_bytes(T2),
-            {#message{offset = Offset, body = #message_body{magic = Magic, attributes = Attr, key = Key, value = Value}}, Tail};
-        _ ->
-            throw("invalid message crc32")
+        CRC32 ->
+            <<Magic:8/?INT, Attr:8/?INT, T2/binary>> = T1,
+            {Key, T3} = decode_bytes(T2),
+            {Value, <<>>} = decode_bytes(T3),
+            Message = #message{offset = Offset, body = #message_body{magic = Magic, attributes = Attr, key = Key, value = Value}},
+            decode_message(Tail, [Message | Acc]);
+        V ->
+            ?ERROR("invalid message crc32, ~p:~p~n", [V, CRC32]),
+            []
     end.
 
+%% message set cannot be decoded by array
 decode_message_set(Data) ->
-    {Count, T1} = decode_array(Data),
-    {Messages, T2} =
-        lists:foldl(fun(_, {L1, TT1}) ->
-            {Message, TT2} = decode_message(TT1),
-            {[Message | L1], TT2}
-        end, {[], T1}, lists:seq(1, Count)),
-    {#message_set{messages = lists:reverse(Messages)}, T2}.
+%%    {Count, T1} = decode_array(Data),
+%%    {Messages, T2} =
+%%        lists:foldl(fun(_, {L1, TT1}) ->
+%%            {Message, TT2} = decode_message(TT1),
+%%            {[Message | L1], TT2}
+%%        end, {[], T1}, lists:seq(1, Count)),
+%%    {#message_set{messages = lists:reverse(Messages)}, T2}.
+    Messages = decode_message(Data, []),
+    #message_set{messages = lists:reverse(Messages)}.
+
 
 decode_topic(Data) ->
     {Name, T1} = decode_string(Data),
@@ -419,12 +422,12 @@ decode_metadata_response(Data) ->
             {[Broker | L1], TT2}
         end, {[], T1}, lists:seq(1, BrokerCount)),
     {TopicCount, T3} = decode_array(T2),
-    {Topics, T4} =
+    {Topics, <<>>} =
         lists:foldl(fun(_, {L2, TT3}) ->
             {Topic, TT4} = decode_metadata_res_topic(TT3),
             {[Topic | L2], TT4}
         end, {[], T3}, lists:seq(1, TopicCount)),
-    {#metadata_response{brokers = lists:reverse(Brokers), topics = lists:reverse(Topics)}, T4}.
+    #metadata_response{brokers = lists:reverse(Brokers), topics = lists:reverse(Topics)}.
 
 decode_metadata_res_broker(<<ID:32/?INT, Tail/binary>>) ->
     {Host, <<Port:32/?INT, NewT/binary>>} = decode_string(Tail),
@@ -457,12 +460,12 @@ decode_metadata_res_partition(<<Error:16/?INT, ID:32/?INT, Leader:32/?INT, Tail/
 
 decode_produce_response(Data) ->
     {TopicsCount, T1} = decode_array(Data),
-    {Topics, T2} =
+    {Topics, <<>>} =
         lists:foldl(fun(_, {L1, TT1}) ->
             {Topic, TT2} = decode_produce_res_topic(TT1),
             {[Topic | L1], TT2}
         end, {[], T1}, lists:seq(1, TopicsCount)),
-    {#produce_response{topics = lists:reverse(Topics)}, T2}.
+    #produce_response{topics = lists:reverse(Topics)}.
 
 decode_produce_res_topic(Data) ->
     {Name, T1} = decode_string(Data),
@@ -479,12 +482,12 @@ decode_produce_res_partition(<<ID:32/?INT, Error:16/?INT, Offset:64/?INT, Tail/b
 
 decode_fetch_response(Data) ->
     {TopicsCount, T1} = decode_array(Data),
-    {Topics, T2} =
+    {Topics, <<>>} =
         lists:foldl(fun(_, {L1, TT1}) ->
             {Topic, TT2} = decode_fetch_res_topic(TT1),
             {[Topic | L1], TT2}
         end, {[], T1}, lists:seq(1, TopicsCount)),
-    {#fetch_response{topics = lists:reverse(Topics)}, T2}.
+    #fetch_response{topics = lists:reverse(Topics)}.
 
 decode_fetch_res_topic(Data) ->
     {Name, T1} = decode_string(Data),
@@ -497,17 +500,17 @@ decode_fetch_res_topic(Data) ->
     {#fetch_res_topic{name = Name, partitions = lists:reverse(Partitions)}, T3}.
 
 decode_fetch_res_partition(<<ID:32/?INT, Error:16/?INT, HmOffset:64/?INT, Size:32/?INT, Messages:Size/binary, Tail/binary>>) ->
-    {MsgSet, <<>>} = decode_message_set(Messages),
+    MsgSet = decode_message_set(Messages),
     {#fetch_res_partition{id = ID, error = Error, hm_offset = HmOffset, message_set = MsgSet}, Tail}.
 
 decode_offset_response(Data) ->
     {TopicsCount, T1} = decode_array(Data),
-    {Topics, T2} =
+    {Topics, <<>>} =
         lists:foldl(fun(_, {L1, TT1}) ->
             {Topic, TT2} = decode_offset_res_topic(TT1),
             {[Topic | L1], TT2}
         end, {[], T1}, lists:seq(1, TopicsCount)),
-    {#offset_response{topics = lists:reverse(Topics)}, T2}.
+    #offset_response{topics = lists:reverse(Topics)}.
 
 decode_offset_res_topic(Data) ->
     {Name, T1} = decode_string(Data),
@@ -519,21 +522,26 @@ decode_offset_res_topic(Data) ->
         end, {[], T2}, lists:seq(1, PartCount)),
     {#offset_res_topic{name = Name, partitions = lists:reverse(Partitions)}, T3}.
 
-decode_offset_res_partition(<<ID:32/?INT, Error:16/?INT, Offset:64/?INT, Tail/binary>>) ->
-    {#offset_res_partition{id = ID, error = Error, offset = Offset}, Tail}.
+decode_offset_res_partition(<<ID:32/?INT, Error:16/?INT, Tail/binary>>) ->
+    {OffsetsCount, T1} = decode_array(Tail),
+    {Offsets, T2} =
+        lists:foldl(fun(_, {L1, <<Offset:64/?INT, TT1/binary>>}) ->
+            {[Offset | L1], TT1}
+        end, {[], T1}, lists:seq(1, OffsetsCount)),
+    {#offset_res_partition{id = ID, error = Error, offsets = lists:reverse(Offsets)}, T2}.
 
 decode_group_coordinator_response(<<Error:16/?INT, ID:32/?INT, Tail/binary>>) ->
-    {Host, <<Port:32/?INT, T1/binary>>} = decode_string(Tail),
-    {#group_coordinator_response{error = Error, id = ID, host = Host, port = Port}, T1}.
+    {Host, <<Port:32/?INT>>} = decode_string(Tail),
+    #group_coordinator_response{error = Error, id = ID, host = Host, port = Port}.
 
 decode_offset_commit_response(Data) ->
     {TopicsCount, T1} = decode_array(Data),
-    {Topics, T2} =
+    {Topics, <<>>} =
         lists:foldl(fun(_, {L1, TT1}) ->
             {Topic, TT2} = decode_offset_commit_res_topic(TT1),
             {[Topic | L1], TT2}
         end, {[], T1}, lists:seq(1, TopicsCount)),
-    {#offset_commit_response{topics = lists:reverse(Topics)}, T2}.
+    #offset_commit_response{topics = lists:reverse(Topics)}.
 
 decode_offset_commit_res_topic(Data) ->
     {Name, T1} = decode_string(Data),
@@ -550,12 +558,12 @@ decode_offset_commit_res_partition(<<ID:32/?INT, Error:16/?INT, Tail/binary>>) -
 
 decode_offset_fetch_response(Data) ->
     {TopicsCount, T1} = decode_array(Data),
-    {Topics, T2} =
+    {Topics, <<>>} =
         lists:foldl(fun(_, {L1, TT1}) ->
             {Topic, TT2} = decode_offset_fetch_res_topic(TT1),
             {[Topic | L1], TT2}
         end, {[], T1}, lists:seq(1, TopicsCount)),
-    {#offset_fetch_response{topics = lists:reverse(Topics)}, T2}.
+    #offset_fetch_response{topics = lists:reverse(Topics)}.
 
 decode_offset_fetch_res_topic(Data) ->
     {Name, T1} = decode_string(Data),
@@ -576,12 +584,12 @@ decode_join_group_response(<<Error:16/?INT, Gen:32/?INT, Tail/binary>>) ->
     {Leader, T2} = decode_string(T1),
     {MemID, T3} = decode_string(T2),
     {MemCount, T4} = decode_array(T3),
-    {Members, T5} =
+    {Members, <<>>} =
         lists:foldl(fun(_, {L1, TT1}) ->
             {Member, TT2} = decode_join_group_res_member(TT1),
             {[Member | L1], TT2}
         end, {[], T4}, lists:seq(1, MemCount)),
-    {#join_group_response{error = Error, generation = Gen, protocol = Protocol, leader = Leader, id = MemID, members = lists:reverse(Members)}, T5}.
+    #join_group_response{error = Error, generation = Gen, protocol = Protocol, leader = Leader, id = MemID, members = lists:reverse(Members)}.
 
 decode_join_group_res_member(Data) ->
     {MemID, T1} = decode_string(Data),
@@ -589,8 +597,8 @@ decode_join_group_res_member(Data) ->
     {#join_group_res_member{id = MemID, metadata = Metadata}, T2}.
 
 decode_sync_group_response(<<Error:16/?INT, Tail/binary>>) ->
-    {Assignment, T1} = decode_group_member_assignment(Tail),
-    {#sync_group_response{error = Error, assignment = Assignment}, T1}.
+    {Assignment, <<>>} = decode_group_member_assignment(Tail),
+    #sync_group_response{error = Error, assignment = Assignment}.
 
 decode_group_member_assignment(<<Ver:16/?INT, Tail/binary>>) ->
     {PartCount, T1} = decode_array(Tail),
@@ -602,20 +610,20 @@ decode_group_member_assignment(<<Ver:16/?INT, Tail/binary>>) ->
     {UserData, T3} = decode_bytes(T2),
     {#group_member_assignment{version = Ver, partitions = lists:reverse(Partitions), user_data = UserData}, T3}.
 
-decode_heartbeat_response(<<Error:16/?INT, Tail/binary>>) ->
-    {#heartbeat_response{error = Error}, Tail}.
+decode_heartbeat_response(<<Error:16/?INT>>) ->
+    #heartbeat_response{error = Error}.
 
-decode_leave_group_response(<<Error:16/?INT, Tail/binary>>) ->
-    {#leave_group_response{error = Error}, Tail}.
+decode_leave_group_response(<<Error:16/?INT>>) ->
+    #leave_group_response{error = Error}.
 
 decode_list_groups_response(<<Error:16/?INT, Tail/binary>>) ->
     {GroupsCount, T1} = decode_array(Tail),
-    {Groups, T2} =
+    {Groups, <<>>} =
         lists:foldl(fun(_, {L1, TT1}) ->
             {Group, TT2} = decode_list_groups_res_group(TT1),
             {[Group | L1], TT2}
         end, {[], T1}, lists:seq(1, GroupsCount)),
-    {#list_groups_response{error = Error, groups = lists:reverse(Groups)}, T2}.
+    #list_groups_response{error = Error, groups = lists:reverse(Groups)}.
 
 decode_list_groups_res_group(Data) ->
     {ID, T1} = decode_string(Data),
@@ -624,12 +632,12 @@ decode_list_groups_res_group(Data) ->
 
 decode_describe_groups_response(Data) ->
     {GroupsCount, T1} = decode_array(Data),
-    {Groups, T2} =
+    {Groups, <<>>} =
         lists:foldl(fun(_, {L1, TT1}) ->
             {Group, TT2} = decode_describe_groups_res_group(TT1),
             {[Group | L1], TT2}
         end, {[], T1}, lists:seq(1, GroupsCount)),
-    {#describe_groups_response{groups = lists:reverse(Groups)}, T2}.
+    #describe_groups_response{groups = lists:reverse(Groups)}.
 
 decode_describe_groups_res_group(<<Error:16/?INT, Tail/binary>>) ->
     {ID, T1} = decode_string(Tail),

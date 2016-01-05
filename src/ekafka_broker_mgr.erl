@@ -122,7 +122,6 @@ handle_info(initialize, State) ->
             lists:map(fun({Key, Value}) ->
                 ekafka_util:set_conf(ekafka_util:to_atom(Key), Value)
             end, Options),
-            ekafka_sup:start_topics_mgr_sup(),
             %% get brokers from zookeeper or configuration
             case ekafka_util:get_conf(brokers) of
                 undefined ->

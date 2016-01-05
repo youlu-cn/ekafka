@@ -176,11 +176,12 @@ get_partition_assignment() ->
     end.
 
 send_to_server_sync(Sock, Request) ->
-    {API, Bin} = ekafka_protocol:encode_request(0, "sync_client", Request),
+    Random = random:uniform(2000000000),
+    {API, Bin} = ekafka_protocol:encode_request(Random, "sync_client", Request),
     F = fun(Trace) ->
             case Trace of
-                0 -> API;
-                _ -> -1
+                Random -> API;
+                _      -> -1
             end
         end,
     case gen_tcp:send(Sock, Bin) of

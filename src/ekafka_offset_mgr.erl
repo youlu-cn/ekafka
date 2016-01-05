@@ -24,11 +24,11 @@
     terminate/2,
     code_change/3]).
 
--record(state, {topic       :: string(),
-                group       :: string(),
-                partitions  :: [#partition{}],
-                offsets     :: [#offset_fetch_res_partition{}],
-                sock        :: port()}).
+-record(state, {topic          :: string(),
+                group          :: string(),
+                partitions     :: [#partition{}],
+                offsets   = [] :: [#offset_fetch_res_partition{}],
+                sock           :: port()}).
 
 %%%===================================================================
 %%% API
@@ -84,12 +84,15 @@ init({Topic, Group, Partitions}) ->
     {stop, Reason :: term(), NewState :: #state{}}).
 handle_call({get_partition_offset, PartID}, _From, #state{offsets = Offsets} = State) ->
     Offset =
-        lists:foldl(fun(#offset_fetch_res_partition{id = ID, offset = R}, Ost) ->
-            case ID of
-                PartID -> R;
-                _      -> Ost
-            end
-        end, undefined, Offsets),
+        case lists:keyfind(PartID, 2, Offsets) of
+            false ->
+                -1;
+            #offset_fetch_res_partition{offset = R} ->
+                case R of
+                    -1 -> 0;
+                    V  -> V
+                end
+        end,
     {reply, {ok, Offset}, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -138,6 +141,7 @@ handle_info(start_connection, #state{group = Group} = State) ->
         undefined ->
             {stop, error_group_coordinator, State};
         Sock ->
+            ?DEBUG("[O] group coordinator connected~n", []),
             erlang:send(self(), sync_consume_offset),
             {noreply, State#state{sock = Sock}}
     end;
@@ -145,9 +149,10 @@ handle_info(sync_consume_offset, #state{group = Group, topic = Name, partitions 
     Request = request_fetch_offset(Group, Name, Partitions),
     case ekafka_util:send_to_server_sync(Sock, Request) of
         undefined ->
-            ?ERROR("[O] fetch offset error", []),
+            ?ERROR("[O] fetch offset error~n", []),
             {noreply, State};
         #offset_fetch_response{topics = [#offset_fetch_res_topic{partitions = PartOffset}]} ->
+            ?DEBUG("[O] sync offset over, topic: ~p, offset: ~p~n", [Name, PartOffset]),
             {noreply, State#state{offsets = PartOffset}}
     end;
 handle_info(_Info, State) ->
@@ -191,13 +196,13 @@ get_group_coordinator(Group) ->
     case request_group_coordinator(Host, Group) of
         undefined ->
             undefined;
-        #group_coordinator_response{error = Error, host = Host, port = Port} ->
-            ?INFO("[O] group coordinator res: ~p, hosts: ~p", [Error, {Host, Port}]),
+        #group_coordinator_response{error = Error, host = NewHost, port = Port} ->
+            ?INFO("[O] group coordinator res: ~p, hosts: ~p~n", [Error, {NewHost, Port}]),
             case Error of
                 ?NO_ERROR ->
-                    case gen_tcp:connect(Host, Port, ekafka_util:get_tcp_options()) of
+                    case gen_tcp:connect(NewHost, Port, ekafka_util:get_tcp_options()) of
                         {error, Reason} ->
-                            ?ERROR("[O] connect to group coordinator ~p error: ~p", [Host, Reason]),
+                            ?ERROR("[O] connect to group coordinator ~p error: ~p~n", [NewHost, Reason]),
                             undefined;
                         {ok, Sock} ->
                             Sock
@@ -210,7 +215,7 @@ get_group_coordinator(Group) ->
 request_group_coordinator({IP, Port} = Host, Group) ->
     case gen_tcp:connect(IP, Port, ekafka_util:get_tcp_options()) of
         {error, Reason} ->
-            ?ERROR("[O] connect to broker ~p error: ~p", [Host, Reason]),
+            ?ERROR("[O] connect to broker ~p error: ~p~n", [Host, Reason]),
             undefined;
         {ok, Sock} ->
             Request = #group_coordinator_request{id = Group},

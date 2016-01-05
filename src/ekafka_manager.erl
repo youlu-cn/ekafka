@@ -83,18 +83,37 @@ init({Name, Role, Group}) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
     {stop, Reason :: term(), NewState :: #state{}}).
-handle_call({pick_worker, Key}, _From, #state{workers = Workers} = State) ->
-    case {ekafka_util:get_partition_assignment(), Key} of
-        {true, undefined} ->
-            {reply, {error, error_invalid_key}, State};
-        {true, _} ->
-            PartID = erlang:phash2(Key, erlang:length(Workers)),
-            {PartID, [Pid1 | Tail1]} = lists:keyfind(PartID, 1, Workers),
-            NewWorkers = lists:keyreplace(PartID, 1, Workers, {PartID, Tail1 ++ [Pid1]}),
-            {reply, {ok, Pid1}, State#state{workers = NewWorkers}};
+handle_call({pick_produce_worker, Key}, _From, #state{role = Role, workers = Workers} = State) ->
+    case Role of
+        producer ->
+            case {ekafka_util:get_partition_assignment(), Key} of
+                {true, undefined} ->
+                    {reply, {error, error_invalid_key}, State};
+                {true, _} ->
+                    PartID = erlang:phash2(Key, erlang:length(Workers)),
+                    {PartID, [Pid1 | Tail1]} = lists:keyfind(PartID, 1, Workers),
+                    NewWorkers = lists:keyreplace(PartID, 1, Workers, {PartID, Tail1 ++ [Pid1]}),
+                    {reply, {ok, Pid1}, State#state{workers = NewWorkers}};
+                _ ->
+                    [{ID2, [Pid2 | Tail2]} | Others] = Workers,
+                    {reply, {ok, Pid2}, State#state{workers = Others ++ [{ID2, Tail2 ++ [Pid2]}]}}
+            end;
         _ ->
-            [{ID2, [Pid2 | Tail2]} | Others] = Workers,
-            {reply, {ok, Pid2}, State#state{workers = Others ++ [{ID2, Tail2 ++ [Pid2]}]}}
+            {reply, {error, invalid_operation}, State}
+    end;
+handle_call({pick_consume_worker, PartID}, _From, #state{role = Role, workers = Workers} = State) ->
+    case Role of
+        consumer ->
+            case PartID of
+                undefined ->
+                    [{ID, [Pid1]} | Others] = Workers,
+                    {reply, {ok, Pid1}, State#state{workers = Others ++ [{ID, [Pid1]}]}};
+                _ ->
+                    {PartID, [Pid]} = lists:keyfind(PartID, 1, Workers),
+                    {reply, {ok, Pid}, State}
+            end;
+        _ ->
+            {reply, {error, invalid_operation}, State}
     end;
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.

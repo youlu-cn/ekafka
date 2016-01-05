@@ -7,21 +7,25 @@
 %%% Created : 29. 十二月 2015 18:24
 %%%-------------------------------------------------------------------
 {application, ekafka, [
-    {description, ""},
+    {description, "erlang kafka client"},
     {vsn, "1"},
     {registered, []},
     {applications, [
         kernel,
-        stdlib
+        stdlib,
+        ezk
     ]},
     {mod, { ekafka, []}},
     {env, [{
         conf, [
             {brokers, [{1, {{10,142,99,87},9092}}, {2, {{10,142,99,88},9092}}, {3, {{10,142,99,89}, 9092}}]},
             %%{zookeeper, [{{10,142,99,87},2181,30000,10000}, {{10,142,99,88},2182,30000,10000}, {{10,142,99,89},2183,30000,10000}]},
+            %% for producer
             {produce_workers, 8},
-            {max_message_bytes, 1048576},
-            {hash_partition_by_key, true}
+            {hash_partition_by_key, true},
+            %% for consumer
+            {consume_from_beginning, true},
+            {max_message_bytes, 1048576}
         ]
     }]}
 ]}.

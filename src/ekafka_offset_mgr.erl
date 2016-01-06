@@ -27,7 +27,7 @@
 -record(state, {topic          :: string(),
                 group          :: string(),
                 partitions     :: [#partition{}],
-                offsets   = [] :: [#offset_fetch_res_partition{}],
+                offsets   = [] :: [{int32(), int64()}],
                 sock           :: port()}).
 
 %%%===================================================================
@@ -82,7 +82,7 @@ init({Topic, Group, Partitions}) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
     {stop, Reason :: term(), NewState :: #state{}}).
-handle_call({get_partition_offset, PartID}, _From, #state{offsets = Offsets} = State) ->
+handle_call({get_partition_offset, PartID}, _From, #state{topic = Name, offsets = Offsets} = State) ->
     Offset =
         case lists:keyfind(PartID, 1, Offsets) of
             false ->
@@ -90,6 +90,7 @@ handle_call({get_partition_offset, PartID}, _From, #state{offsets = Offsets} = S
             {PartID, R} ->
                 R
         end,
+    ?DEBUG("[O] get partition offset ~p:~p, offset: ~p~n", [Name, PartID, Offset]),
     {reply, {ok, Offset}, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -105,13 +106,14 @@ handle_call(_Request, _From, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
-handle_cast({message_consumed, PartID, Offset}, #state{offsets = Offsets} = State) ->
+handle_cast({message_consumed, PartID, Offset}, #state{topic = Name, offsets = Offsets} = State) ->
     case lists:keyfind(PartID, 1, Offsets) of
         false ->
             ?ERROR("[O] invalid partition id: ~p~n", [PartID]),
             {noreply, State};
         _ ->
-            NewOffsets = lists:keyreplace(PartID, 1, {PartID, Offset}, Offsets),
+            NewOffsets = lists:keyreplace(PartID, 1, Offsets, {PartID, Offset}),
+            ?DEBUG("[O] message consumed ~p:~p, old: ~p, new: ~p~n", [Name, PartID, Offsets, NewOffsets]),
             {noreply, State#state{offsets = NewOffsets}}
     end;
 handle_cast(_Request, State) ->
@@ -153,7 +155,7 @@ handle_info(sync_consume_offset, #state{group = Group, topic = Name, partitions 
                     Partition = lists:keyfind(ID, 2, Partitions),
                     {[{ID, Ost} | L1], [Partition#partition{offset = Ost} | L2]}
                 end, {[], []}, PartOffsets),
-            ?DEBUG("[O] sync offset over, topic: ~p, offset: ~p~n", [Name, Offsets]),
+            ?DEBUG("[O] sync offset over, topic: ~p, offset: ~p, partitions: ~p~n", [Name, Offsets, NewPartitions]),
             {noreply, State#state{offsets = Offsets, partitions = NewPartitions}}
     end;
 handle_info(auto_commit_offset, #state{group = Group, topic = Name, partitions = Partitions, offsets = Offsets, sock = Sock} = State) ->
@@ -161,12 +163,15 @@ handle_info(auto_commit_offset, #state{group = Group, topic = Name, partitions =
         lists:foldl(fun(#partition{id = PartID, offset = Offset} = Partition, L) ->
             case lists:keyfind(PartID, 1, Offsets) of
                 {PartID, Offset} ->
+                    ?DEBUG("[O] offset not changed ~p:~p, ~p~n", [Name, PartID, Offsets]),
                     [Partition | L];
                 {PartID, NewOffset} ->
+                    ?DEBUG("[O] offset changed ~p:~p, old: ~p, new: ~p~n", [Name, PartID, Offset, NewOffset]),
                     commit_offset(Sock, Name, Group, PartID, NewOffset),
                     [Partition#partition{offset = NewOffset} | L]
             end
         end, [], Partitions),
+    erlang:send_after(ekafka_util:get_offset_auto_commit_timeout(), self(), auto_commit_offset),
     {noreply, State#state{partitions = NewPartitions}};
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -221,6 +226,7 @@ get_group_coordinator(Group) ->
                             Sock
                     end;
                 _ ->
+                    ?ERROR("[O] group coordinator response error: ~p~n", [ekafka_util:get_error_message(Error)]),
                     undefined
             end
     end.
@@ -252,5 +258,5 @@ commit_offset(Sock, Name, Group, PartID, Offset) ->
         undefined ->
             ?ERROR("[O] commit offset failed, ~p:~p~n", [Name, PartID]);
         #offset_commit_response{} ->
-            ?DEBUG("[O] offset committed~n", [])
+            ?DEBUG("[O] offset committed ~p:~p, offset: ~p~n", [Name, PartID, Offset])
     end.

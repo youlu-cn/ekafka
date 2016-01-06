@@ -34,7 +34,7 @@
 
 -record(partition, {id         :: int32(),
                     lead       :: int32(),
-                    offset = 0 :: int64(),
+                    offset= -1 :: int64(),
                     isr        :: list(int32())}).
 
 

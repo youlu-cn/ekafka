@@ -181,6 +181,12 @@ get_offset_auto_commit_timeout() ->
         Value     -> Value
     end.
 
+get_fetch_max_timeout() ->
+    case get_conf(consume_block_timeout) of
+        undefined -> 5000;
+        Value     -> Value
+    end.
+
 
 send_to_server_sync(Sock, Request) ->
     Random = random:uniform(2000000000),

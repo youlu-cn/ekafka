@@ -14,7 +14,7 @@
 -behaviour(supervisor).
 
 %% API
--export([start_link/3, start_worker_sup/1, start_offset_manager/3]).
+-export([start_link/3, start_worker_sup/1, start_offset_manager/3, consume/3]).
 
 -export([produce/3]).
 
@@ -75,6 +75,27 @@ produce(Type, Topic, [{Key, _V}|_] = KVList) ->
             gen_server:call(Pid, {produce, Type, KVList});
         {error, Error} ->
             {error, Error}
+    end.
+
+consume(Type, Topic, Partition) ->
+    case gen_server:call(ekafka_util:get_topic_manager_name(Topic), {pick_consume_worker, Partition}) of
+        {error, Error} ->
+            {error, Error};
+        {ok, Pid} ->
+            Res = gen_server:call(Pid, {consume, Type}),
+            case Type of
+                async ->
+                    receive
+                        {ekafka, fetched, []} ->
+                            consume(Type, Topic, Partition);
+                        {ekafka, fetched, MsgList} ->
+                            {ok, MsgList};
+                        {ekafka, error, Error} ->
+                            {error, Error}
+                    end;
+                _ ->
+                    Res
+            end
     end.
 
 %%%===================================================================

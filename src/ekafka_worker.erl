@@ -103,7 +103,7 @@ handle_call({produce, Type, KVList}, From, #state{topic = Topic, partition = Par
 handle_call({consume, Type}, From, #state{topic = Topic, partition = Part, role = Role, trace_id = Trace, sock = Sock, offset = Offset} = State) ->
     case Role of
         consumer ->
-            Request = handle_consume(Topic, Part, Offset),
+            Request = handle_consume(Type, Topic, Part, Offset),
             NewTrace = get_trace_id(Trace),
             %% Type :: atom(), sync | async
             erlang:spawn(?MODULE, send_request, [Sock, {Type, From, self(), NewTrace, Request}]),
@@ -163,11 +163,12 @@ handle_info(init_begin_offset, #state{sock = Sock, topic = Name, role = Role, pa
     end;
 handle_info(sync_group_offset, #state{topic = Name, partition = #partition{id = PartID}, offset = Offset} = State) ->
     case sync_message_offset(Name, PartID) of
+        -1 ->
+            ?DEBUG("[W] no group consume offset for ~p:~p, use local: ~p~n", [Name, PartID, Offset]),
+            {noreply, State};
         Res when Res > Offset ->
             ?INFO("[W] got group consume offset, ~p:~p, value: ~p~n", [Name, PartID, Res]),
-            {noreply, State#state{offset = Offset}};
-        _ ->
-            {noreply, State}
+            {noreply, State#state{offset = Offset}}
     end;
 
 %% handle socket
@@ -240,7 +241,8 @@ handle_info({response_error, CorrId}, #state{dict = Dict} = State) ->
         sync ->
             gen_server:reply(From, {error, server_error});
         async ->
-            erlang:send(From, {ekafka, error, server_error})
+            {Pid, _} = From,
+            erlang:send(Pid, {ekafka, error, server_error})
     end,
     {noreply, State#state{dict = dict:erase(CorrId, Dict)}};
 
@@ -365,12 +367,17 @@ handle_produce_response(Type, From, #produce_response{topics = [#produce_res_top
             end
     end.
 
-handle_consume(Name, #partition{id = ID}, Offset) ->
+handle_consume(Type, Name, #partition{id = ID}, Offset) ->
     Partition = #fetch_req_partition{id = ID, offset = Offset, max_bytes = ekafka_util:get_max_message_size()},
     Topic = #fetch_req_topic{name = Name, partitions = [Partition]},
-    #fetch_request{topics = [Topic]}.
+    BlockTime =
+        case Type of
+            sync -> 100;
+            _    -> ekafka_util:get_fetch_max_timeout()
+        end,
+    #fetch_request{max_wait = BlockTime, topics = [Topic]}.
 
-handle_consume_response(Type, From, #fetch_response{topics = Topics}) ->
+handle_consume_response(Type, {Pid, _} = From, #fetch_response{topics = Topics}) ->
     {Consumed, MsgList} =
         case Topics of
             [] ->
@@ -401,7 +408,7 @@ handle_consume_response(Type, From, #fetch_response{topics = Topics}) ->
         sync ->
             gen_server:reply(From, {ok, MsgList});
         async ->
-            erlang:send(From, {ekafka, fetched, MsgList})
+            erlang:send(Pid, {ekafka, fetched, MsgList})
     end,
     Consumed.
 
@@ -410,7 +417,7 @@ sync_message_offset(Name, PartID) ->
         {ok, Offset} ->
             Offset;
         _ ->
-            0
+            -1
     end.
 
 get_init_offset(Sock, Name, PartID) ->

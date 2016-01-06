@@ -109,12 +109,23 @@ handle_call({pick_consume_worker, PartID}, _From, #state{role = Role, workers = 
                     [{ID, [Pid1]} | Others] = Workers,
                     {reply, {ok, Pid1}, State#state{workers = Others ++ [{ID, [Pid1]}]}};
                 _ ->
-                    {PartID, [Pid]} = lists:keyfind(PartID, 1, Workers),
-                    {reply, {ok, Pid}, State}
+                    case lists:keyfind(PartID, 1, Workers) of
+                        {PartID, [Pid]} ->
+                            {reply, {ok, Pid}, State};
+                        ERR ->
+                            ?DEBUG("0000000 ~p", [ERR]),
+                            {reply, {error, error_invalid_partition}, State}
+                    end
             end;
         _ ->
             {reply, {error, invalid_operation}, State}
     end;
+handle_call(get_partition_list, _From, #state{partitions = Partitions} = State) ->
+    IDList =
+        lists:foldl(fun(#partition{id = ID}, L) ->
+            [ID | L]
+        end, [], Partitions),
+    {reply, {ok, IDList}, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 

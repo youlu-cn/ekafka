@@ -14,7 +14,7 @@
 %% Application callbacks
 -export([start/2, stop/1]).
 
--export([add_producer/1, add_consumer/2, produce/2, consume/2]).
+-export([add_producer/1, add_consumer/2, produce/2, get_partition_list/1, consume/2]).
 
 %%%===================================================================
 %%% Application callbacks
@@ -62,13 +62,15 @@ produce(Topic, KVList) ->
 add_consumer(Topic, Group) ->
     ekafka_topics_mgr_sup:add_topic(Topic, consumer, Group).
 
+-spec get_partition_list(Topic :: string()) ->
+    {ok, list(integer())}.
+get_partition_list(Topic) ->
+    gen_server:call(ekafka_util:get_topic_manager_name(Topic), get_partition_list).
+
+-spec consume(Topic :: string(), Partition :: undefined | integer()) ->
+    {error, Error :: atom()} | {ok, MsgList :: list(tuple())} | ok.
 consume(Topic, Partition) ->
-    case gen_server:call(ekafka_util:get_topic_manager_name(Topic), {pick_consume_worker, Partition}) of
-        {ok, Pid} ->
-            gen_server:call(Pid, {consume, sync});
-        {error, Error} ->
-            {error, Error}
-    end.
+    ekafka_topic_sup:consume(async, Topic, Partition).
 
 %%--------------------------------------------------------------------
 %% @private

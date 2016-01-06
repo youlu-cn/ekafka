@@ -116,6 +116,12 @@ handle_call({pick_consume_worker, PartID}, _From, #state{role = Role, workers = 
         _ ->
             {reply, {error, invalid_operation}, State}
     end;
+handle_call(get_partition_list, _From, #state{partitions = Partitions} = State) ->
+    IDList =
+        lists:foldl(fun(#partition{id = ID}, L) ->
+            [ID | L]
+                    end, [], Partitions),
+    {reply, {ok, IDList}, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 

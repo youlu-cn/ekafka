@@ -183,7 +183,7 @@ get_offset_auto_commit_timeout() ->
 
 get_fetch_max_timeout() ->
     case get_conf(consume_block_timeout) of
-        undefined -> 5000;
+        undefined -> 500;
         Value     -> Value
     end.
 

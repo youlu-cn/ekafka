@@ -168,7 +168,7 @@ handle_info(sync_group_offset, #state{topic = Name, partition = #partition{id = 
             {noreply, State};
         Res when Res > Offset ->
             ?INFO("[W] got group consume offset, ~p:~p, value: ~p~n", [Name, PartID, Res]),
-            {noreply, State#state{offset = Offset}}
+            {noreply, State#state{offset = Res}}
     end;
 
 %% handle socket

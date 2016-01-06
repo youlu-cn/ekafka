@@ -110,8 +110,12 @@ handle_call({pick_consume_worker, PartID}, _From, #state{role = Role, workers = 
                     [{ID, [Pid1]} | Others] = Workers,
                     {reply, {ok, Pid1}, State#state{workers = Others ++ [{ID, [Pid1]}]}};
                 _ ->
-                    {PartID, [Pid]} = lists:keyfind(PartID, 1, Workers),
-                    {reply, {ok, Pid}, State}
+                    case lists:keyfind(PartID, 1, Workers) of
+                        {PartID, [Pid]} ->
+                            {reply, {ok, Pid}, State};
+                        _ ->
+                            {reply, {error, error_invalid_partition}, State}
+                    end
             end;
         _ ->
             {reply, {error, invalid_operation}, State}

@@ -112,8 +112,7 @@ handle_call({pick_consume_worker, PartID}, _From, #state{role = Role, workers = 
                     case lists:keyfind(PartID, 1, Workers) of
                         {PartID, [Pid]} ->
                             {reply, {ok, Pid}, State};
-                        ERR ->
-                            ?DEBUG("0000000 ~p", [ERR]),
+                        _ ->
                             {reply, {error, error_invalid_partition}, State}
                     end
             end;

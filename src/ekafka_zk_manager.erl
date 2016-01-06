@@ -184,7 +184,7 @@ handle_info(get_topic_metadata, #state{topic = Name, zk = Pid} = State) ->
             ?ERROR("[MGR] zookeeper error", []),
             {stop, error_zookeeper_error, State};
         Partitions ->
-            ?DEBUG("[MGR] topic ~p metadata, partitions: ~p~n", [Name, Partitions]),
+            ?INFO("[MGR] topic ~p metadata, partitions: ~p~n", [Name, Partitions]),
             erlang:send(self(), start_offset_mgr),
             {noreply, State#state{partitions = Partitions}}
     end;
@@ -199,7 +199,7 @@ handle_info(start_offset_mgr, #state{topic = Name, group = Group, partitions = P
     {noreply, State};
 handle_info(start_workers, #state{sup = Sup, topic = Name, partitions = Partitions, role = Role} = State) ->
     Max = ekafka_util:get_worker_process_count(Role),
-    ?DEBUG("[MGR] starting workers for topic ~p, count: ~p, role: ~p~n", [Name, Max, Role]),
+    ?INFO("[MGR] starting workers for topic ~p, count: ~p, role: ~p~n", [Name, Max, Role]),
     Workers =
         lists:foldl(fun(#partition{id = ID} = Partition, L1) ->
             PartWorkers =

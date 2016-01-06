@@ -403,11 +403,15 @@ decode_message(<<Offset:64/?INT, Size:32/?INT, Body:Size/binary, Tail/binary>>, 
             {Key, T3} = decode_bytes(T2),
             {Value, <<>>} = decode_bytes(T3),
             Message = #message{offset = Offset, body = #message_body{magic = Magic, attributes = Attr, key = Key, value = Value}},
-            decode_message(Tail, [Message | Acc]);
+            %decode_message(Tail, [Message | Acc]);
+            decode_message(Tail, Acc ++ [Message]);
         V ->
             ?ERROR("invalid message crc32, ~p:~p~n", [V, CRC32]),
             []
-    end.
+    end;
+decode_message(<<Offset:64/?INT, Size:32/?INT, Tail/binary>>, Acc) ->
+    ?DEBUG("discard offset ~p, because no enough data ~p:~p~n", [Offset, Size, erlang:size(Tail)]),
+    Acc.
 
 %% message set cannot be decoded by array
 decode_message_set(Data) ->
@@ -419,7 +423,8 @@ decode_message_set(Data) ->
 %%        end, {[], T1}, lists:seq(1, Count)),
 %%    {#message_set{messages = lists:reverse(Messages)}, T2}.
     Messages = decode_message(Data, []),
-    #message_set{messages = lists:reverse(Messages)}.
+    %%#message_set{messages = lists:reverse(Messages)}.
+    #message_set{messages = Messages}.
 
 
 decode_topic(Data) ->

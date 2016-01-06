@@ -159,15 +159,15 @@ get_max_message_size() ->
 
 get_topic_supervisor_name(Topic) ->
     Name = lists:concat([Topic, "_topic_sup"]),
-    to_atom(Name).
+    to_atom(lists:flatten(Name)).
 
 get_topic_manager_name(Topic) ->
     Name = lists:concat([Topic, "_mgr"]),
-    to_atom(Name).
+    to_atom(lists:flatten(Name)).
 
 get_topic_offset_mgr_name(Topic) ->
     Name = lists:concat([Topic, "_offset_mgr"]),
-    to_atom(Name).
+    to_atom(lists:flatten(Name)).
 
 get_partition_assignment() ->
     case get_conf(hash_partition_by_key) of
@@ -184,6 +184,12 @@ get_offset_auto_commit_timeout() ->
 get_fetch_max_timeout() ->
     case get_conf(consume_block_timeout) of
         undefined -> 500;
+        Value     -> Value
+    end.
+
+get_wait_all_servers() ->
+    case get_conf(wait_all_servers) of
+        undefined -> true;
         Value     -> Value
     end.
 
@@ -284,3 +290,6 @@ get_error_message(Code) ->
         _ -> %%?UNKNOWN or others
             "An unexpected server error"
     end.
+
+null(_) -> "".
+null(_, _) -> "".

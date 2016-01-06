@@ -22,7 +22,8 @@
             %%{zookeeper, [{{10,142,99,87},2181,30000,10000}, {{10,142,99,88},2182,30000,10000}, {{10,142,99,89},2183,30000,10000}]},
             %% for producer
             {produce_workers, 8},
-            {hash_partition_by_key, true},
+            {wait_all_servers, true},
+            {hash_partition_by_key, false},
             %% for consumer
             {auto_commit_timeout, 30000},
             {consume_block_timeout, 500},

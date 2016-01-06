@@ -37,7 +37,7 @@ start_link() ->
 -spec add_topic(Topic :: string(), Role :: producer | consumer, Group :: string()) ->
     {ok, pid()} | any().
 add_topic(Topic, Role, Group) ->
-    TopicSupSpec = {ekafka_topic_sup,
+    TopicSupSpec = {Topic,
         {ekafka_topic_sup, start_link, [Topic, Role, Group]},
         permanent,
         10500,

@@ -143,7 +143,7 @@ handle_cast(_Request, State) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
 handle_info(start_connection, #state{topic = Name, partition = #partition{id = ID, lead = Lead}} = State) ->
-    ?DEBUG("[W] start worker connection, topic: ~p, partition: ~p~n", [Name, ID]),
+    ?INFO("[W] start worker connection, topic: ~p, partition: ~p~n", [Name, ID]),
     case connect_to_lead_broker(Lead) of
         undefined ->
             ?ERROR("[W] init failed to connect broker, exit..~n", []),
@@ -342,11 +342,16 @@ handle_produce(Name, #partition{id = ID}, KVList) ->
         end, [], KVList),
     Partition = #produce_req_partition{id = ID, message_set = #message_set{messages = Messages}},
     Topic = #produce_req_topic{name = Name, partitions = [Partition]},
-    #produce_request{topics = [Topic]}.
+    Acks =
+        case ekafka_util:get_wait_all_servers() of
+            true -> ?ACKS_WAIT_ALL;
+            _    -> ?ACKS_WAIT_ONE
+        end,
+    #produce_request{acks = Acks, topics = [Topic]}.
 
 handle_produce_response(Type, From, #produce_response{topics = [#produce_res_topic{name = Name, partitions = [Partition]}]}) ->
     #produce_res_partition{id = ID, error = Error, offset = Offset} = Partition,
-    ?DEBUG("[W] got produce response, topic: ~p, partition: ~p, error: ~p, offset: ~p~n", [Name, ID, Error, Offset]),
+    ?INFO("[W] got produce response, topic: ~p, partition: ~p, error: ~p, offset: ~p~n", [Name, ID, Error, Offset]),
     case Error of
         ?NO_ERROR ->
             case Type of
@@ -404,6 +409,7 @@ handle_consume_response(Type, {Pid, _} = From, #fetch_response{topics = Topics})
                         end
                 end
         end,
+    ?DEBUG("[W] messages received, ~p~n", [MsgList]),
     case Type of
         sync ->
             gen_server:reply(From, {ok, MsgList});
@@ -435,7 +441,7 @@ get_init_offset(Sock, Name, PartID) ->
             [Offset|_] = Offsets,
             case Error of
                 ?NO_ERROR ->
-                    ?DEBUG("[W] the begin offset of ~p:~p is ~p~n", [Name, PartID, Offset]),
+                    ?INFO("[W] the begin offset of ~p:~p is ~p~n", [Name, PartID, Offset]),
                     Offset;
                 _ ->
                     handle_server_errors(Error),

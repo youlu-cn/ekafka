@@ -28,7 +28,7 @@
                 group          :: string(),
                 partitions     :: [#partition{}],
                 offsets   = [] :: [{int32(), int64()}],
-                sock           :: port()}).
+                port           :: port() | pid()}).
 
 %%%===================================================================
 %%% API
@@ -134,40 +134,43 @@ handle_cast(_Request, State) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
 handle_info(start_connection, #state{group = Group} = State) ->
-    case get_group_coordinator(Group) of
+    case start_offset_connection(Group) of
         undefined ->
             {stop, error_group_coordinator, State};
-        Sock ->
+        Port ->
             ?DEBUG("[O] group coordinator connected~n", []),
             erlang:send(self(), sync_consume_offset),
-            {noreply, State#state{sock = Sock}}
+            {noreply, State#state{port = Port}}
     end;
-handle_info(sync_consume_offset, #state{group = Group, topic = Name, partitions = Partitions, sock = Sock} = State) ->
-    Request = request_fetch_offset(Group, Name, Partitions),
+handle_info(sync_consume_offset, #state{group = Group, topic = Name, partitions = Partitions, port = Port} = State) ->
+    NewState =
+        case sync_consumed_offset(Port, Group, Name, Partitions) of
+            undefined ->
+                State;
+            [] ->
+                State;
+            NewPartitions ->
+                Offsets =
+                    lists:foldl(fun(#partition{id = ID, offset = Offset}, L) ->
+                        [{ID, Offset} | L]
+                    end, [], NewPartitions),
+                State#state{offsets = Offsets, partitions = NewPartitions}
+        end,
     erlang:send_after(ekafka_util:get_offset_auto_commit_timeout(), self(), auto_commit_offset),
-    case ekafka_util:send_to_server_sync(Sock, Request) of
-        undefined ->
-            ?ERROR("[O] fetch offset error~n", []),
-            {noreply, State};
-        #offset_fetch_response{topics = [#offset_fetch_res_topic{partitions = PartOffsets}]} ->
-            {Offsets, NewPartitions} =
-                lists:foldl(fun(#offset_fetch_res_partition{id = ID, offset = Ost}, {L1, L2}) ->
-                    Partition = lists:keyfind(ID, 2, Partitions),
-                    {[{ID, Ost} | L1], [Partition#partition{offset = Ost} | L2]}
-                end, {[], []}, PartOffsets),
-            ?DEBUG("[O] sync offset over, topic: ~p, offset: ~p, partitions: ~p~n", [Name, Offsets, NewPartitions]),
-            {noreply, State#state{offsets = Offsets, partitions = NewPartitions}}
-    end;
-handle_info(auto_commit_offset, #state{group = Group, topic = Name, partitions = Partitions, offsets = Offsets, sock = Sock} = State) ->
+    {noreply, NewState};
+handle_info(auto_commit_offset, #state{group = Group, topic = Name, partitions = Partitions, offsets = Offsets, port = Port} = State) ->
     NewPartitions =
         lists:foldl(fun(#partition{id = PartID, offset = Offset} = Partition, L) ->
             case lists:keyfind(PartID, 1, Offsets) of
+                false ->
+                    ?DEBUG("[O] no message consumed for ~p:~p~n", [Name, PartID]),
+                    [Partition | L];
                 {PartID, Offset} ->
                     ?DEBUG("[O] offset not changed ~p:~p, ~p~n", [Name, PartID, Offsets]),
                     [Partition | L];
                 {PartID, NewOffset} ->
                     ?DEBUG("[O] offset changed ~p:~p, old: ~p, new: ~p~n", [Name, PartID, Offset, NewOffset]),
-                    commit_offset(Sock, Name, Group, PartID, NewOffset),
+                    commit_offset(Port, Group, Name, PartID, NewOffset),
                     [Partition#partition{offset = NewOffset} | L]
             end
         end, [], Partitions),
@@ -209,9 +212,36 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-get_group_coordinator(Group) ->
-    [{_,Host}|_T] = ekafka_util:get_conf(brokers),
-    case request_group_coordinator(Host, Group) of
+
+%%
+start_offset_connection(Group) ->
+    case ekafka_util:get_conf(zookeeper) of
+        undefined ->
+            start_kafka_offset_connection(Group);
+        ZkConf ->
+            start_zookeeper_offset_connection(ZkConf)
+    end.
+
+sync_consumed_offset(Port, Group, Topic, Partitions) ->
+    case ekafka_util:get_conf(zookeeper) of
+        undefined ->
+            sync_consumed_offset_from_kafka(Port, Group, Topic, Partitions);
+        _ ->
+            sync_consumed_offset_from_zookeeper(Port, Group, Topic, Partitions)
+    end.
+
+commit_offset(Port, Group, Name, PartID, Offset) ->
+    case ekafka_util:get_conf(zookeeper) of
+        undefined ->
+            commit_offset_to_kafka(Port, Group, Name, PartID, Offset);
+        _ ->
+            commit_offset_to_zookeeper(Port, Group, Name, PartID, Offset)
+    end.
+
+
+%% Kafka Offset Management
+start_kafka_offset_connection(Group) ->
+    case request_group_coordinator(Group) of
         undefined ->
             undefined;
         #group_coordinator_response{error = Error, host = NewHost, port = Port} ->
@@ -231,10 +261,38 @@ get_group_coordinator(Group) ->
             end
     end.
 
-request_group_coordinator({IP, Port} = Host, Group) ->
+sync_consumed_offset_from_kafka(Port, Group, Topic, Partitions) ->
+    Request = request_fetch_offset(Group, Topic, Partitions),
+    case ekafka_util:send_to_server_sync(Port, Request) of
+        undefined ->
+            ?ERROR("[O] fetch consumer offset error for group: ~p, topic: ~p~n", [Group, Topic]),
+            undefined;
+        #offset_fetch_response{topics = [#offset_fetch_res_topic{partitions = PartOffsets}]} ->
+            NewPartitions =
+                lists:foldl(fun(#offset_fetch_res_partition{id = ID, offset = Offset}, L) ->
+                    Partition = lists:keyfind(ID, 2, Partitions),
+                    [Partition#partition{offset = Offset} | L]
+                end, [], PartOffsets),
+            ?DEBUG("[O] sync offset over, topic: ~p, partitions: ~p~n", [Topic, NewPartitions]),
+            NewPartitions
+    end.
+
+commit_offset_to_kafka(Port, Group, Name, PartID, Offset) ->
+    Partition = #offset_commit_req_partition{id = PartID, offset = Offset},
+    Topic = #offset_commit_req_topic{name = Name, partitions = [Partition]},
+    Request = #offset_commit_request{group_id = Group, topics = [Topic]},
+    case ekafka_util:send_to_server_sync(Port, Request) of
+        undefined ->
+            ?ERROR("[O] commit offset failed, ~p:~p, group: ~p~n", [Name, PartID, Group]);
+        #offset_commit_response{} ->
+            ?DEBUG("[O] offset committed ~p:~p, group: ~p, offset: ~p~n", [Name, PartID, Group, Offset])
+    end.
+
+request_group_coordinator(Group) ->
+    [{_,{IP, Port}}|_T] = ekafka_util:get_conf(brokers),
     case gen_tcp:connect(IP, Port, ekafka_util:get_tcp_options()) of
         {error, Reason} ->
-            ?ERROR("[O] connect to broker ~p error: ~p~n", [Host, Reason]),
+            ?ERROR("[O] connect to broker ~p error: ~p~n", [IP, Reason]),
             undefined;
         {ok, Sock} ->
             Request = #group_coordinator_request{id = Group},
@@ -250,13 +308,35 @@ request_fetch_offset(Group, Topic, Parts) ->
         end, [], Parts),
     #offset_fetch_request{group_id = Group, topics = [#offset_fetch_req_topic{name = Topic, partitions = Partitions}]}.
 
-commit_offset(Sock, Name, Group, PartID, Offset) ->
-    Partition = #offset_commit_req_partition{id = PartID, offset = Offset},
-    Topic = #offset_commit_req_topic{name = Name, partitions = [Partition]},
-    Request = #offset_commit_request{group_id = Group, topics = [Topic]},
-    case ekafka_util:send_to_server_sync(Sock, Request) of
-        undefined ->
-            ?ERROR("[O] commit offset failed, ~p:~p~n", [Name, PartID]);
-        #offset_commit_response{} ->
-            ?DEBUG("[O] offset committed ~p:~p, offset: ~p~n", [Name, PartID, Offset])
+
+%% zookeeper Offset Management
+start_zookeeper_offset_connection(ZkConf) ->
+    {ok, Pid} = ezk:start_connection(ZkConf),
+    ?DEBUG("[O] zookeeper connected ~p~n", [Pid]),
+    Pid.
+
+sync_consumed_offset_from_zookeeper(Port, Group, Topic, Partitions) ->
+    NewPartitions =
+        lists:foldl(fun(#partition{id = PartID} = Partition, L) ->
+            Path = lists:concat(["/consumers/", Group, "/offsets/", Topic, "/", PartID]),
+            case ezk:get(Port, lists:flatten(Path)) of
+                {ok, {Offset, _}} ->
+                    [Partition#partition{offset = ekafka_util:to_integer(Offset)} | L];
+                _ ->
+                    [Partition | L]
+            end
+        end, [], Partitions),
+    ?DEBUG("[O] sync offset over, topic: ~p, partitions: ~p~n", [Topic, NewPartitions]),
+    NewPartitions.
+
+commit_offset_to_zookeeper(Port, Group, Name, PartID, Offset) ->
+    Path = lists:concat(["/consumers/", Group, "/offsets/", Name, "/", PartID]),
+    case ezk:set(Port, lists:flatten(Path), ekafka_util:to_binary(Offset)) of
+        {ok, _} ->
+            ?DEBUG("[O] offset commited ~p:~p, offset: ~p~n", [Name, PartID, Offset]);
+        {error, no_dir} ->
+            ?DEBUG("[O] create node for group: ~p, topic: ~p, partition: ~p, offset: ~p~n", [Group, Name, PartID, Offset]),
+            ezk:create(Port, lists:flatten(Path), ekafka_util:to_binary(Offset));
+        Error ->
+            ?ERROR("[O] commit offset failed ~p, ~p:~p~n", [Error, Name, PartID])
     end.

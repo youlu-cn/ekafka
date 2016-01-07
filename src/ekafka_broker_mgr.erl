@@ -193,7 +193,7 @@ get_brokers(Pid, BrokerIDs) ->
     lists:foldl(fun(ID, L) ->
         Broker = ekafka_util:to_integer(ID),
         Path = lists:concat(["/brokers/ids/", Broker]),
-        case ezk:get(Pid, Path) of
+        case ezk:get(Pid, lists:flatten(Path)) of
             {error, _Error} ->
                 L;
             {ok, {Bin,_}} ->

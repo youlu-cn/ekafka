@@ -91,7 +91,7 @@ init({Name, Partition, Role}) ->
 handle_call({produce, Type, KVList}, From, #state{topic = Topic, partition = Part, role = Role, trace_id = Trace, sock = Sock} = State) ->
     case Role of
         producer ->
-            Request = handle_produce(Topic, Part, KVList),
+            Request = handle_produce_request(Topic, Part, KVList),
             ?DEBUG("[W] produce request data: ~p~n", [Request]),
             NewTrace = get_trace_id(Trace),
             %% Type :: atom(), sync | async
@@ -103,7 +103,7 @@ handle_call({produce, Type, KVList}, From, #state{topic = Topic, partition = Par
 handle_call({consume, Type}, From, #state{topic = Topic, partition = Part, role = Role, trace_id = Trace, sock = Sock, offset = Offset} = State) ->
     case Role of
         consumer ->
-            Request = handle_consume(Type, Topic, Part, Offset),
+            Request = handle_consume_request(Type, Topic, Part, Offset),
             NewTrace = get_trace_id(Trace),
             %% Type :: atom(), sync | async
             erlang:spawn(?MODULE, send_request, [Sock, {Type, From, self(), NewTrace, Request}]),
@@ -162,13 +162,13 @@ handle_info(init_begin_offset, #state{sock = Sock, topic = Name, role = Role, pa
             {noreply, State#state{offset = Offset}}
     end;
 handle_info(sync_group_offset, #state{topic = Name, partition = #partition{id = PartID}, offset = Offset} = State) ->
-    case sync_message_offset(Name, PartID) of
-        -1 ->
+    case gen_server:call(ekafka_util:get_topic_offset_mgr_name(Name), {get_partition_offset, PartID}) of
+        {ok, GroupOffset} when GroupOffset > Offset ->
+            ?INFO("[W] got group consume offset, ~p:~p, value: ~p~n", [Name, PartID, GroupOffset]),
+            {noreply, State#state{offset = GroupOffset}};
+        _ ->
             ?DEBUG("[W] no group consume offset for ~p:~p, use local: ~p~n", [Name, PartID, Offset]),
-            {noreply, State};
-        Res when Res > Offset ->
-            ?INFO("[W] got group consume offset, ~p:~p, value: ~p~n", [Name, PartID, Res]),
-            {noreply, State#state{offset = Res}}
+            {noreply, State}
     end;
 
 %% handle socket
@@ -180,21 +180,22 @@ handle_info({re_connect, Reason, Times}, #state{topic = Name, partition = #parti
     ?WARNING("[W] ~p reconnecting to broker, reason: ~p, topic: ~p, partition: ~p~n", [Times, Reason, Name, ID]),
     case connect_to_lead_broker(Lead) of
         undefined ->
-            erlang:send_after(1000, self(), {re_connect, Reason, Times + 1}),
+            ?ERROR("[W] reconnect failed, retried times ~p~n", [Times]),
+            erlang:send_after(100, self(), {re_connect, Reason, Times + 1}),
             {noreply, State};
         {ok, Sock} ->
             ?INFO("[W] broker reconnected, ~p:~p~n", [Name, ID]),
             {noreply, State#state{sock = Sock}}
     end;
-handle_info({tcp_closed, _Sock}, State) ->
-    %%TODO: don't assign works before re-connected
+handle_info({tcp_closed, Sock}, State) ->
     ?WARNING("[W] server closed connection, reconnect later~n", []),
-    erlang:send_after(100, self(), {re_connect, tcp_closed, 1}),
+    gen_tcp:close(Sock),
+    erlang:send(self(), {re_connect, tcp_closed, 1}),
     {noreply, State};
-handle_info({tcp_error, _Sock, Reason}, State) ->
-    %%TODO: don't assign works before re-connected
+handle_info({tcp_error, Sock, Reason}, State) ->
     ?ERROR("[W] tcp error occurs, ~p, reconnect later~n", [Reason]),
-    erlang:send_after(100, self(), {re_connect, tcp_error, 1}),
+    gen_tcp:close(Sock),
+    erlang:send_after(50, self(), {re_connect, tcp_error, 1}),
     {noreply, State};
 
 %% handle request callback
@@ -204,30 +205,25 @@ handle_info({request_sent, Type, From, Trace, API}, #state{dict = Dict} = State)
         async -> gen_server:reply(From, ok);
         _     -> ok
     end,
-    RS = #request_state{type = Type, from = From, api = API},
-    {noreply, State#state{dict = dict:store(Trace, RS, Dict)}};
-handle_info({request_failed, Type, From, Reason}, State) ->
-    case Type of
-        internal ->
-            ?ERROR("[W] internal error: ~p~n", [Reason]);
-        _ -> %% sync or async
-            gen_server:reply(From, {error, Reason})
-    end,
+    Record = #request_state{type = Type, from = From, api = API},
+    {noreply, State#state{dict = dict:store(Trace, Record, Dict)}};
+handle_info({request_failed, _Type, From, Reason}, State) ->
+    gen_server:reply(From, {error, Reason}),
     {noreply, State};
 
 %% handle response callback
 handle_info({response_received, CorrId, Response}, #state{topic = Name, dict = Dict, partition = #partition{id = PartID}} = State) ->
-    #request_state{type = Type, from = From} = dict:fetch(CorrId, Dict),
-    case Response of
-        #produce_response{} ->
+    #request_state{type = Type, from = From, api = API} = dict:fetch(CorrId, Dict),
+    case API of
+        ?PRODUCE_REQUEST ->
             handle_produce_response(Type, From, Response),
             {noreply, State#state{dict = dict:erase(CorrId, Dict)}};
-        #fetch_response{} ->
+        ?FETCH_REQUEST ->
             case handle_consume_response(Type, From, Response) of
                 0 ->
                     {noreply, State#state{dict = dict:erase(CorrId, Dict)}};
                 Offset ->
-                    handle_message_consumed(Name, PartID, Offset + 1),
+                    gen_server:cast(ekafka_util:get_topic_offset_mgr_name(Name), {message_consumed, PartID, Offset}),
                     {noreply, State#state{dict = dict:erase(CorrId, Dict), offset = Offset + 1}}
             end;
         _ ->
@@ -236,8 +232,6 @@ handle_info({response_received, CorrId, Response}, #state{topic = Name, dict = D
 handle_info({response_error, CorrId}, #state{dict = Dict} = State) ->
     #request_state{type = Type, from = From} = dict:fetch(CorrId, Dict),
     case Type of
-        internal ->
-            ?ERROR("[W] internal error~n", []);
         sync ->
             gen_server:reply(From, {error, server_error});
         async ->
@@ -298,43 +292,31 @@ connect_to_lead_broker(Lead) ->
             end
     end.
 
-get_trace_id(Trace) ->
-    case Trace of
-        2147483647 -> 0;
-        _          -> Trace + 1
+get_init_offset(Sock, Name, PartID) ->
+    Time =
+        case ekafka_util:get_conf(consume_from_beginning) of
+            false -> ?REQ_LATEST_OFFSET;
+            _     -> ?REQ_EARLIEST_OFFSET
+        end,
+    Topic = #offset_req_topic{name = Name, partitions = [#offset_req_partition{time = Time, id = PartID}]},
+    Request = #offset_request{topics = [Topic]},
+    case ekafka_util:send_to_server_sync(Sock, Request) of
+        undefined ->
+            0;
+        #offset_response{topics = [#offset_res_topic{partitions = [#offset_res_partition{error = Error, offsets = Offsets}]}]} ->
+            [Offset|_] = Offsets,
+            case Error of
+                ?NO_ERROR ->
+                    ?INFO("[W] the begin offset of ~p:~p is ~p~n", [Name, PartID, Offset]),
+                    Offset;
+                _ ->
+                    ?ERROR("[W] get topic ~p:~p initial offset failed ~p~n", [Name, PartID, Error]),
+                    0
+            end
     end.
 
-handle_server_errors(Error) ->
-    %%TODO: check error code when broker changed
-    ?ERROR("[W] server error ~p [~p]~n", [Error, ekafka_util:get_error_message(Error)]).
-
-query_response_api(Dict, CorrId) ->
-    case dict:find(CorrId, Dict) of
-        error ->
-            -1;
-        {ok, #request_state{api = API}} ->
-            API
-    end.
-
-decode_response({M,F,A}, Worker, Data) ->
-    case ekafka_protocol:decode_response({M,F,A}, Data) of
-        {CorrId, undefined} ->
-            erlang:send(Worker, {response_error, CorrId});
-        {CorrId, Response} ->
-            erlang:send(Worker, {response_received, CorrId, Response})
-    end.
-
-send_request(Sock, {Type, From, Worker, Trace, Request}) ->
-    {API, Bin} = ekafka_protocol:encode_request(Trace, Worker, Request),
-    case gen_tcp:send(Sock, Bin) of
-        {error, Reason} ->
-            ?ERROR("[W] ~p send to server failed, ~p~n", [Worker, Reason]),
-            erlang:send(Worker, {request_failed, Type, From, Reason});
-        ok ->
-            erlang:send(Worker, {request_sent, Type, From, Trace, API})
-    end.
-
-handle_produce(Name, #partition{id = ID}, KVList) ->
+%% handle requests
+handle_produce_request(Name, #partition{id = ID}, KVList) ->
     Messages =
         lists:foldr(fun({Key, Value}, L) ->
             Body = #message_body{key = Key, value = Value},
@@ -349,30 +331,7 @@ handle_produce(Name, #partition{id = ID}, KVList) ->
         end,
     #produce_request{acks = Acks, topics = [Topic]}.
 
-handle_produce_response(Type, From, #produce_response{topics = [#produce_res_topic{name = Name, partitions = [Partition]}]}) ->
-    #produce_res_partition{id = ID, error = Error, offset = Offset} = Partition,
-    ?INFO("[W] got produce response, topic: ~p, partition: ~p, error: ~p, offset: ~p~n", [Name, ID, Error, Offset]),
-    case Error of
-        ?NO_ERROR ->
-            case Type of
-                sync ->
-                    gen_server:reply(From, ok);
-                async ->
-                    %% TODO: for async response
-                    ok
-            end;
-        _ ->
-            ?ERROR("[W] produce server error, topic: ~p, partition: ~p, error: ~p~n", [Name, ID, Error]),
-            case Type of
-                sync ->
-                    gen_server:reply(From, {error, Error});
-                async ->
-                    %% TODO: for async response
-                    ok
-            end
-    end.
-
-handle_consume(Type, Name, #partition{id = ID}, Offset) ->
+handle_consume_request(Type, Name, #partition{id = ID}, Offset) ->
     Partition = #fetch_req_partition{id = ID, offset = Offset, max_bytes = ekafka_util:get_max_message_size()},
     Topic = #fetch_req_topic{name = Name, partitions = [Partition]},
     BlockTime =
@@ -381,6 +340,28 @@ handle_consume(Type, Name, #partition{id = ID}, Offset) ->
             _    -> ekafka_util:get_fetch_max_timeout()
         end,
     #fetch_request{max_wait = BlockTime, topics = [Topic]}.
+
+%% handle response
+handle_produce_response(Type, {Pid, _} = From, #produce_response{topics = [#produce_res_topic{name = Name, partitions = [Partition]}]}) ->
+    #produce_res_partition{id = ID, error = Error, offset = Offset} = Partition,
+    ?INFO("[W] got produce response, topic: ~p, partition: ~p, error: ~p, offset: ~p~n", [Name, ID, Error, Offset]),
+    case Error of
+        ?NO_ERROR ->
+            case Type of
+                sync ->
+                    gen_server:reply(From, ok);
+                async ->
+                    ok
+            end;
+        _ ->
+            ?ERROR("[W] produce server error, topic: ~p, partition: ~p, error: ~p~n", [Name, ID, Error]),
+            case Type of
+                sync ->
+                    gen_server:reply(From, {error, Error});
+                async ->
+                    erlang:send(Pid, {ekafka, error, error_produce_error})
+            end
+    end.
 
 handle_consume_response(Type, {Pid, _} = From, #fetch_response{topics = Topics}) ->
     {Consumed, MsgList} =
@@ -404,7 +385,6 @@ handle_consume_response(Type, {Pid, _} = From, #fetch_response{topics = Topics})
                                     {M2, [{{ID, Offset}, {Key, Value}} | L]}
                                 end, {0, []}, Messages);
                             _ ->
-                                handle_server_errors(Error),
                                 {0, []}
                         end
                 end
@@ -418,36 +398,39 @@ handle_consume_response(Type, {Pid, _} = From, #fetch_response{topics = Topics})
     end,
     Consumed.
 
-sync_message_offset(Name, PartID) ->
-    case gen_server:call(ekafka_util:get_topic_offset_mgr_name(Name), {get_partition_offset, PartID}) of
-        {ok, Offset} ->
-            Offset;
-        _ ->
-            -1
+
+%% encode and decode data
+send_request(Sock, {Type, From, Worker, Trace, Request}) ->
+    {API, Bin} = ekafka_protocol:encode_request(Trace, Worker, Request),
+    case gen_tcp:send(Sock, Bin) of
+        {error, Reason} ->
+            ?ERROR("[W] ~p send to server failed, ~p~n", [Worker, Reason]),
+            erlang:send(Worker, {request_failed, Type, From, Reason});
+        ok ->
+            erlang:send(Worker, {request_sent, Type, From, Trace, API})
     end.
 
-get_init_offset(Sock, Name, PartID) ->
-    Time =
-        case ekafka_util:get_conf(consume_from_beginning) of
-            false -> ?REQ_LATEST_OFFSET;
-            _     -> ?REQ_EARLIEST_OFFSET
-        end,
-    Topic = #offset_req_topic{name = Name, partitions = [#offset_req_partition{time = Time, id = PartID}]},
-    Request = #offset_request{topics = [Topic]},
-    case ekafka_util:send_to_server_sync(Sock, Request) of
-        undefined ->
-            0;
-        #offset_response{topics = [#offset_res_topic{partitions = [#offset_res_partition{error = Error, offsets = Offsets}]}]} ->
-            [Offset|_] = Offsets,
-            case Error of
-                ?NO_ERROR ->
-                    ?INFO("[W] the begin offset of ~p:~p is ~p~n", [Name, PartID, Offset]),
-                    Offset;
-                _ ->
-                    handle_server_errors(Error),
-                    0
-            end
+decode_response({M,F,A}, Worker, Data) ->
+    case ekafka_protocol:decode_response({M,F,A}, Data) of
+        {CorrId, undefined} ->
+            ?ERROR("[W] decode response failed, ~p~n", [Data]),
+            erlang:send(Worker, {response_error, CorrId});
+        {CorrId, Response} ->
+            erlang:send(Worker, {response_received, CorrId, Response})
     end.
 
-handle_message_consumed(Topic, PartID, Offset) ->
-    gen_server:cast(ekafka_util:get_topic_offset_mgr_name(Topic), {message_consumed, PartID, Offset}).
+
+%% Util functions
+get_trace_id(Trace) ->
+    case Trace of
+        2147483647 -> 0;
+        _          -> Trace + 1
+    end.
+
+query_response_api(Dict, CorrId) ->
+    case dict:find(CorrId, Dict) of
+        error ->
+            -1;
+        {ok, #request_state{api = API}} ->
+            API
+    end.

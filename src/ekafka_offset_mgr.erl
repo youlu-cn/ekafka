@@ -192,7 +192,13 @@ handle_info(_Info, State) ->
 %%--------------------------------------------------------------------
 -spec(terminate(Reason :: (normal | shutdown | {shutdown, term()} | term()),
         State :: #state{}) -> term()).
-terminate(_Reason, _State) ->
+terminate(_Reason, #state{port = Port}) ->
+    case ekafka_util:get_conf(zookeeper) of
+        undefined ->
+            gen_tcp:close(Port);
+        _ ->
+            ezk:end_connection(Port, shutdown)
+    end,
     ok.
 
 %%--------------------------------------------------------------------

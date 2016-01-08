@@ -26,8 +26,8 @@
 
 -define(SERVER, ?MODULE).
 
--record(state, {zk         :: pid() | undfined,
-                brokers}).
+-record(state, {zk          :: pid() | undfined,
+                topics = [] :: [string()]}).
 
 %%%===================================================================
 %%% API
@@ -95,6 +95,8 @@ handle_call(_Request, _From, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
+handle_cast({topic_added, Topic}, #state{topics = Topics} = State) ->
+    {noreply, State#state{topics = [Topic | Topics]}};
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -145,6 +147,20 @@ handle_info(find_brokers, State) ->
                     {noreply, State#state{zk = Pid}}
             end
     end;
+
+%% zookeeper callbacks
+handle_info({broker_changed, _}, #state{zk = Pid, topics = Topics} = State) ->
+    ?ERROR("[B] kafka broker changed~n", []),
+    case get_brokers_list(Pid) of
+        [] ->
+            {stop, error_zookeeper_error, State};
+        Brokers ->
+            ekafka_util:set_conf(brokers, Brokers),
+            lists:foreach(fun(Name) ->
+                gen_server:cast(ekafka_util:get_topic_manager_name(Name), kafka_broker_down)
+            end, Topics),
+            {noreply, State}
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -161,8 +177,14 @@ handle_info(_Info, State) ->
 %%--------------------------------------------------------------------
 -spec(terminate(Reason :: (normal | shutdown | {shutdown, term()} | term()),
         State :: #state{}) -> term()).
-terminate(_Reason, _State) ->
-    ok.
+terminate(_Reason, #state{zk = Pid}) ->
+    case Pid of
+        undefined ->
+            ok;
+        _ ->
+            ezk:end_connection(Pid, shutdown),
+            ok
+    end.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -182,7 +204,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 get_brokers_list(Pid) ->
-    case ezk:ls(Pid, "/brokers/ids") of
+    case ezk:ls(Pid, "/brokers/ids", self(), broker_changed) of
         {error, _Error} ->
             [];
         {ok, IDList} ->

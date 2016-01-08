@@ -37,15 +37,21 @@ start_link() ->
 -spec add_topic(Topic :: string(), Role :: producer | consumer, Group :: string()) ->
     {ok, pid()} | any().
 add_topic(Topic, Role, Group) ->
-    TopicSupSpec = {Topic,
-        {ekafka_topic_sup, start_link, [Topic, Role, Group]},
-        permanent,
-        10500,
-        supervisor,
-        [ekafka_topic_sup]},
+    case erlang:whereis(ekafka_util:get_topic_supervisor_name(Topic)) of
+        undefined ->
+            TopicSupSpec = {Topic,
+                {ekafka_topic_sup, start_link, [Topic, Role, Group]},
+                permanent,
+                10500,
+                supervisor,
+                [ekafka_topic_sup]},
 
-    supervisor:start_child(?SERVER, TopicSupSpec),
-    ok.
+            supervisor:start_child(?SERVER, TopicSupSpec),
+            gen_server:cast(ekafka_broker_mgr, {topic_added, Topic}),
+            ok;
+        _ ->
+            {error, already_started}
+    end.
 
 %%%===================================================================
 %%% Supervisor callbacks

@@ -29,7 +29,7 @@
                 role          :: atom(),
                 group         :: string(),
                 sup           :: pid(),
-                workers}).
+                workers  = [] :: [{integer(), [pid()]}]}).
 
 %%%===================================================================
 %%% API
@@ -83,42 +83,19 @@ init({Topic, Role, Group}) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
     {stop, Reason :: term(), NewState :: #state{}}).
-handle_call({pick_produce_worker, Key}, _From, #state{role = Role, workers = Workers} = State) ->
-    case Role of
-        producer ->
-            case {ekafka_util:get_partition_assignment(), Key} of
-                {true, undefined} ->
-                    {reply, {error, error_invalid_key}, State};
-                {true, _} ->
-                    PartID = erlang:phash2(Key, erlang:length(Workers)),
-                    {PartID, [Pid1 | Tail1]} = lists:keyfind(PartID, 1, Workers),
-                    NewWorkers = lists:keyreplace(PartID, 1, Workers, {PartID, Tail1 ++ [Pid1]}),
-                    {reply, {ok, Pid1}, State#state{workers = NewWorkers}};
-                _ ->
-                    [{ID2, [Pid2 | Tail2]} | Others] = Workers,
-                    {reply, {ok, Pid2}, State#state{workers = Others ++ [{ID2, Tail2 ++ [Pid2]}]}}
-            end;
-        _ ->
-            {reply, {error, invalid_operation}, State}
-    end;
-handle_call({pick_consume_worker, PartID}, _From, #state{role = Role, workers = Workers} = State) ->
-    case Role of
-        consumer ->
-            case PartID of
-                undefined ->
-                    [{ID, [Pid1]} | Others] = Workers,
-                    {reply, {ok, Pid1}, State#state{workers = Others ++ [{ID, [Pid1]}]}};
-                _ ->
-                    case lists:keyfind(PartID, 1, Workers) of
-                        {PartID, [Pid]} ->
-                            {reply, {ok, Pid}, State};
-                        _ ->
-                            {reply, {error, error_invalid_partition}, State}
-                    end
-            end;
-        _ ->
-            {reply, {error, invalid_operation}, State}
-    end;
+handle_call({pick_worker, Arg}, _From, #state{role = Role, workers = Workers} = State) ->
+    PartID =
+        case Role of
+            producer ->
+                case ekafka_util:get_partition_assignment() of
+                    true -> erlang:phash2(Arg, erlang:length(Workers));
+                    _    -> undefined
+                end;
+            consumer ->
+                Arg
+        end,
+    {Pid, NewWorkers} = handle_pick_worker(PartID, Workers),
+    {reply, {ok, Pid}, State#state{workers = NewWorkers}};
 handle_call(get_partition_list, _From, #state{partitions = Partitions} = State) ->
     IDList =
         lists:foldl(fun(#partition{id = ID}, L) ->
@@ -139,6 +116,20 @@ handle_call(_Request, _From, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
+%% worker started, add to workers list
+handle_cast({worker_started, PartID, Pid}, #state{workers = Workers} = State) ->
+    case lists:keyfind(PartID, 1, Workers) of
+        false ->
+            {noreply, State#state{workers = [{PartID, [Pid]} | Workers]}};
+        {PartID, PidList} ->
+            Partition = {PartID, [Pid | PidList]},
+            {noreply, State#state{workers = lists:keyreplace(PartID, 1, Workers, Partition)}}
+    end;
+
+%% kafka broker down
+handle_cast(kafka_broker_down, State) ->
+    %% TODO:
+    {noreply, State};
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -188,17 +179,13 @@ handle_info(start_offset_mgr, #state{topic = Name, group = Group, partitions = P
 handle_info(start_workers, #state{sup = Sup, topic = Name, partitions = Partitions, role = Role} = State) ->
     Max = ekafka_util:get_worker_process_count(Role),
     ?INFO("[MGR] starting workers for topic ~p, count: ~p, role: ~p~n", [Name, Max, Role]),
-    Workers =
-        lists:foldl(fun(#partition{id = ID} = Partition, L1) ->
-            PartWorkers =
-                lists:foldl(fun(_, L2) ->
-                    {ok, Pid} = supervisor:start_child(Sup, [Name, Partition, Role]),
-                    _Ref = erlang:monitor(process, Pid),
-                    [Pid | L2]
-                end, [], lists:seq(1, Max)),
-            [{ID, PartWorkers} | L1]
-        end, [], Partitions),
-    {noreply, State#state{workers = Workers}};
+    lists:foreach(fun(Partition) ->
+        lists:foreach(fun(_) ->
+            {ok, Pid} = supervisor:start_child(Sup, [Name, Partition, Role]),
+            _Ref = erlang:monitor(process, Pid)
+        end, [], lists:seq(1, Max))
+    end, Partitions),
+    {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -235,6 +222,18 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+%% @return
+%%  {Pid, NewWorkers}
+handle_pick_worker(undefined, [{PartID, [Pid | Left]} | OtherParts]) ->
+    Partition = {PartID, Left ++ [Pid]},
+    NewWorkers = OtherParts ++ [Partition],
+    {Pid, NewWorkers};
+handle_pick_worker(PartID, Workers) ->
+    {PartID, [Pid | Left]} = lists:keyfind(PartID, 1, Workers),
+    Partition = {PartID, Left ++ [Pid]},
+    NewWorkers = lists:keyreplace(PartID, 1, Workers, Partition),
+    {Pid, NewWorkers}.
 
 %% @return
 %%  {error, Reason} - Fail
@@ -306,25 +305,27 @@ to_partitions([#metadata_res_partition{}|_] = List) ->
 %% Topic metadata from zookeeper
 get_topic_metadata_by_zookeeper(ZkConf, Name) ->
     {ok, Pid} = ezk:start_connection(ZkConf),
-    case get_partition_list(Pid, Name) of
-        undefined ->
-            ?INFO("[MGR] topic ~p not created, creating...~n", [Name]),
-            %% request topic metadata can create the topic
-            case request_topic_metadata(Name) of
-                undefined ->
-                    ?INFO("[MGR] failed to create topic ~p~n", [Name]),
-                    {error, error_create_topic_failed};
-                _ ->
-                    erlang:send_after(5000, self(), get_topic_metadata),
-                    undefined
-            end;
-        [] ->
-            ?ERROR("[MGR] zookeeper error", []),
-            {error, error_zookeeper_error};
-        Partitions ->
-            ?INFO("[MGR] topic ~p metadata, partitions: ~p~n", [Name, Partitions]),
-            Partitions
-    end.
+    Response =
+        case get_partition_list(Pid, Name) of
+            undefined ->
+                ?INFO("[MGR] topic ~p not created, creating...~n", [Name]),
+                %% request topic metadata can create the topic
+                case request_topic_metadata(Name) of
+                    undefined ->
+                        ?INFO("[MGR] failed to create topic ~p~n", [Name]),
+                        {error, error_create_topic_failed};
+                    _ ->
+                        undefined
+                end;
+            [] ->
+                ?ERROR("[MGR] zookeeper error", []),
+                {error, error_zookeeper_error};
+            Partitions ->
+                ?INFO("[MGR] topic ~p metadata, partitions: ~p~n", [Name, Partitions]),
+                Partitions
+        end,
+    ezk:end_connection(Pid, stop),
+    Response.
 
 get_partition_list(Pid, Topic) ->
     Path = lists:concat(["/brokers/topics/", Topic, "/partitions"]),

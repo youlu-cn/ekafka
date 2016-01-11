@@ -24,11 +24,14 @@
     terminate/2,
     code_change/3]).
 
+-compile(export_all).
+
 -record(state, {topic         :: string(),
                 partitions    :: [#partition{}],
                 role          :: atom(),
                 group         :: string(),
                 sup           :: pid(),
+                monitors = [] :: [pid()],
                 workers  = [] :: [{integer(), [pid()]}]}).
 
 %%%===================================================================
@@ -84,6 +87,7 @@ init({Topic, Role, Group}) ->
     {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
     {stop, Reason :: term(), NewState :: #state{}}).
 handle_call({pick_worker, Arg}, _From, #state{role = Role, workers = Workers} = State) ->
+    ?DEBUG("[MGR] all workers list: ~p~n", [Workers]),
     PartID =
         case Role of
             producer ->
@@ -94,8 +98,12 @@ handle_call({pick_worker, Arg}, _From, #state{role = Role, workers = Workers} = 
             consumer ->
                 Arg
         end,
-    {Pid, NewWorkers} = handle_pick_worker(PartID, Workers),
-    {reply, {ok, Pid}, State#state{workers = NewWorkers}};
+    case handle_pick_worker(PartID, Workers) of
+        {undefined, _} ->
+            {reply, {error, workers_not_ready}, State};
+        {Pid, NewWorkers} ->
+            {reply, {ok, Pid}, State#state{workers = NewWorkers}}
+    end;
 handle_call(get_partition_list, _From, #state{partitions = Partitions} = State) ->
     IDList =
         lists:foldl(fun(#partition{id = ID}, L) ->
@@ -118,6 +126,7 @@ handle_call(_Request, _From, State) ->
     {stop, Reason :: term(), NewState :: #state{}}).
 %% worker started, add to workers list
 handle_cast({worker_started, PartID, Pid}, #state{workers = Workers} = State) ->
+    %?DEBUG("[MGR] worker ~p for partition ~p started, workers list: ~p~n", [Pid, PartID, Workers]),
     case lists:keyfind(PartID, 1, Workers) of
         false ->
             {noreply, State#state{workers = [{PartID, [Pid]} | Workers]}};
@@ -125,11 +134,43 @@ handle_cast({worker_started, PartID, Pid}, #state{workers = Workers} = State) ->
             Partition = {PartID, [Pid | PidList]},
             {noreply, State#state{workers = lists:keyreplace(PartID, 1, Workers, Partition)}}
     end;
+handle_cast({worker_interrupted, PartID, Pid}, #state{workers = Workers} = State) ->
+    %?DEBUG("[MGR] worker ~p for partition ~p down, workers list: ~p~n", [Pid, PartID, Workers]),
+    case lists:keyfind(PartID, 1, Workers) of
+        false ->
+            {noreply, State};
+        {PartID, PidList} ->
+            Partition = {PartID, [P || P <- PidList, P =/= Pid]},
+            {noreply, State#state{workers = lists:keyreplace(PartID, 1, Workers, Partition)}}
+    end;
 
 %% kafka broker down
-handle_cast(kafka_broker_down, State) ->
-    %% TODO:
-    {noreply, State};
+handle_cast(kafka_broker_down, #state{topic = Name, monitors = PidList, partitions = OldPartitions, workers = Workers} = State) ->
+    ?WARNING("[MGR] kafka broker down, re-get metadata for topic ~p~n", [Name]),
+    case get_topic_metadata(Name) of
+        undefined ->
+            ?ERROR("[MGR] this should not occur, wait for next down message to retry~n", []),
+            {noreply, State};
+        {error, Error} ->
+            ?ERROR("[MGR] get topic ~p metadata failed ~p~n", [Name, Error]),
+            {stop, Error, State};
+        Partitions ->
+            ?INFO("[MGR] got topic ~p metadata, partitions: ~p~n", [Name, Partitions]),
+            case check_which_broker_down(OldPartitions, Partitions) of
+                [] ->
+                    {noreply, State};
+                PartitionList ->
+                    NewWorkers =
+                        lists:foldl(fun(#partition{id = PartID}, L) ->
+                            lists:keydelete(PartID, 1, L)
+                        end, Workers, PartitionList),
+                    ?DEBUG("[MGR] cast message to all workers ~p~n", [PidList]),
+                    lists:foreach(fun(Pid) ->
+                        gen_server:cast(Pid, {kafka_broker_down, PartitionList})
+                    end, PidList),
+                    {noreply, State#state{partitions = Partitions, workers = NewWorkers}}
+            end
+    end;
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -179,13 +220,18 @@ handle_info(start_offset_mgr, #state{topic = Name, group = Group, partitions = P
 handle_info(start_workers, #state{sup = Sup, topic = Name, partitions = Partitions, role = Role} = State) ->
     Max = ekafka_util:get_worker_process_count(Role),
     ?INFO("[MGR] starting workers for topic ~p, count: ~p, role: ~p~n", [Name, Max, Role]),
-    lists:foreach(fun(Partition) ->
-        lists:foreach(fun(_) ->
-            {ok, Pid} = supervisor:start_child(Sup, [Name, Partition, Role]),
-            _Ref = erlang:monitor(process, Pid)
-        end, [], lists:seq(1, Max))
-    end, Partitions),
-    {noreply, State};
+    PidList =
+        lists:foldl(fun(Partition, L1) ->
+            L =
+                lists:foldl(fun(_, L2) ->
+                    {ok, Pid} = supervisor:start_child(Sup, [Name, Partition, Role]),
+                    _Ref = erlang:monitor(process, Pid),
+                    [Pid | L2]
+                end, [], lists:seq(1, Max)),
+            L1 ++ L
+        end, [], Partitions),
+    ?DEBUG("[MGR] worker pids ~p~n", [PidList]),
+    {noreply, State#state{monitors = PidList}};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -225,15 +271,61 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% @return
 %%  {Pid, NewWorkers}
+handle_pick_worker(_, []) ->
+    {undefined, []};
+handle_pick_worker(undefined, [{PartID, []} | OtherParts]) ->
+    case pick_worker_from(OtherParts, [{PartID, []}]) of
+        {Pid, NewWorkers} ->
+            {Pid, NewWorkers};
+        _ ->
+            {undefined, []}
+    end;
 handle_pick_worker(undefined, [{PartID, [Pid | Left]} | OtherParts]) ->
     Partition = {PartID, Left ++ [Pid]},
     NewWorkers = OtherParts ++ [Partition],
     {Pid, NewWorkers};
 handle_pick_worker(PartID, Workers) ->
-    {PartID, [Pid | Left]} = lists:keyfind(PartID, 1, Workers),
-    Partition = {PartID, Left ++ [Pid]},
-    NewWorkers = lists:keyreplace(PartID, 1, Workers, Partition),
+    case lists:keyfind(PartID, 1, Workers) of
+        false ->
+            {undefined, []};
+        {PartID, []} ->
+            {undefined, []};
+        {PartID, [Pid | Left]} ->
+            Partition = {PartID, Left ++ [Pid]},
+            NewWorkers = lists:keyreplace(PartID, 1, Workers, Partition),
+            {Pid, NewWorkers}
+    end.
+
+pick_worker_from([], L) ->
+    L;
+pick_worker_from([{PartID, []} | OtherParts], L) ->
+    pick_worker_from(OtherParts, L ++ [{PartID, []}]);
+pick_worker_from([{PartID, [Pid | Left]} | OtherParts], L) ->
+    NewWorkers = L ++ OtherParts ++ [{PartID, Left ++ [Pid]}],
     {Pid, NewWorkers}.
+
+get_leader_hosts(Lead) ->
+    case lists:keyfind(Lead, 1, ekafka_util:get_conf(brokers)) of
+        false ->
+            ?ERROR("[MGR] cannot found lead ~p broker in: ~p~n", [Lead, ekafka_util:get_conf(brokers)]),
+            undefined;
+        {Lead, Hosts} ->
+            Hosts
+    end.
+
+check_which_broker_down(OldPartitions, NewPartitions) ->
+    ?DEBUG("[MGR] kafka server changed, old partitions: ~p, new: ~p~n", [OldPartitions, NewPartitions]),
+    lists:foldl(fun(#partition{id = PartID, lead = Lead}, L) ->
+        case lists:keyfind(PartID, 2, NewPartitions) of
+            false ->
+                L;
+            #partition{lead = Lead} ->
+                L;
+            #partition{lead = NewLead, host = NewHost} = Partition ->
+                ?WARNING("[MGR] broker ~p down, use ~p, host: ~p~n", [Lead, NewLead, NewHost]),
+                [Partition | L]
+        end
+    end, [], OldPartitions).
 
 %% @return
 %%  {error, Reason} - Fail
@@ -249,10 +341,11 @@ get_topic_metadata(Name) ->
 
 %% Topic metadata from kafka
 get_topic_metadata_by_kafka(Name) ->
-    case request_topic_metadata(Name) of
+    case request_topic_metadata(ekafka_util:get_conf(brokers), Name) of
         undefined ->
             {error, error_socket_error};
-        #metadata_response{topics = [#metadata_res_topic{error = Err1, partitions = Partitions}]} ->
+        #metadata_response{topics = [#metadata_res_topic{error = Err1, partitions = Partitions}], brokers = Brokers} ->
+            set_brokers(Brokers),
             case Err1 of
                 ?NO_ERROR ->
                     Err3 =
@@ -264,10 +357,10 @@ get_topic_metadata_by_kafka(Name) ->
                             end
                         end, ?NO_ERROR, Partitions),
                     case Err3 of
-                        ?NO_ERROR ->
+                        E when E =:= ?NO_ERROR; E =:= ?REPLICA_NOT_AVAILABLE ->
                             to_partitions(Partitions);
                         ?LEADER_NOT_AVAILABLE ->
-                            ?INFO("[MGR] topic ~n is creating, try later~n", [Name]),
+                            ?INFO("[MGR] topic ~p is creating, try later~n", [Name]),
                             undefined;
                         _ ->
                             ?ERROR("[MGR] Kafka response error: ~p~n", [ekafka_util:get_error_message(Err3)]),
@@ -281,9 +374,13 @@ get_topic_metadata_by_kafka(Name) ->
             {error, Reason}
     end.
 
-request_topic_metadata(Name) ->
-    [{_,{IP, Port}}|_T] = ekafka_util:get_conf(brokers),
+request_topic_metadata([], _Name) ->
+    ?ERROR("[O] all brokers are not available~n", []),
+    {error, cannot_connect};
+request_topic_metadata([{_,{IP, Port}} | Others], Name) ->
     case gen_tcp:connect(IP, Port, ekafka_util:get_tcp_options()) of
+        {error, econnrefused} ->
+            request_topic_metadata(Others, Name);
         {error, Reason} ->
             ?ERROR("[MGR] connect to broker ~p error: ~p~n", [IP, Reason]),
             {error, Reason};
@@ -294,8 +391,16 @@ request_topic_metadata(Name) ->
             Res
     end.
 
+set_brokers(BrokerList) ->
+    Brokers =
+        lists:foldr(fun(#metadata_res_broker{id = ID, host = Host, port = Port}, L) ->
+            [{ID, {Host, Port}} | L]
+        end, [], BrokerList),
+    ekafka_util:set_conf(brokers, Brokers).
+
 to_partition(#metadata_res_partition{id = ID, leader = Lead, isr = Isr}) ->
-    #partition{id = ID, lead = Lead, isr = Isr}.
+    {Host, Port} = get_leader_hosts(Lead),
+    #partition{id = ID, lead = Lead, isr = Isr, host = Host, port = Port}.
 to_partitions([#metadata_res_partition{}|_] = List) ->
     lists:foldr(fun(Partition, L) ->
         [to_partition(Partition) | L]
@@ -310,7 +415,7 @@ get_topic_metadata_by_zookeeper(ZkConf, Name) ->
             undefined ->
                 ?INFO("[MGR] topic ~p not created, creating...~n", [Name]),
                 %% request topic metadata can create the topic
-                case request_topic_metadata(Name) of
+                case request_topic_metadata(ekafka_util:get_conf(brokers), Name) of
                     undefined ->
                         ?INFO("[MGR] failed to create topic ~p~n", [Name]),
                         {error, error_create_topic_failed};
@@ -359,7 +464,8 @@ get_partitions(Pid, Name, PartitionIDs) ->
                                 LeadID
                         end
                     end, 0, binary:split(Bin1, <<",">>, [global, trim_all])),
-                [#partition{id = ekafka_util:to_integer(ID), lead = Leader, isr = get_isr_list(Bin1)} | L]
+                {Host, Port} = get_leader_hosts(Leader),
+                [#partition{id = ekafka_util:to_integer(ID), lead = Leader, isr = get_isr_list(Bin1), host = Host, port = Port} | L]
         end
     end, [], PartitionIDs).
 

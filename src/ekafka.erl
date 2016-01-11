@@ -14,7 +14,7 @@
 %% Application callbacks
 -export([start/2, stop/1]).
 
--export([add_producer/1, add_consumer/2, produce/2, get_partition_list/1, consume/2]).
+-export([add_producer/1, add_consumer/2, produce/2, get_partition_list/1, consume/1, consume/2]).
 
 %%%===================================================================
 %%% Application callbacks
@@ -37,40 +37,13 @@
     {ok, pid(), State :: term()} |
     {error, Reason :: term()}).
 start(_StartType, _StartArgs) ->
-    ensure_app_started(ezk),
+    ekafka_util:ensure_app_started(ezk),
     case ekafka_sup:start_link() of
         {ok, Pid} ->
             {ok, Pid};
         Error ->
             Error
     end.
-
--spec add_producer(Topic :: string()) ->
-    ok.
-add_producer(Topic) ->
-    ekafka_topics_mgr_sup:add_topic(Topic, producer, undefined).
-
--spec produce(Topic :: string(), tuple() | list(tuple())) ->
-    {error, any()} | ok.
-produce(Topic, {Key, Value}) ->
-    produce(Topic, [{Key, Value}]);
-produce(Topic, KVList) ->
-    ekafka_topic_sup:produce(sync, Topic, KVList).
-
--spec add_consumer(Topic :: string(), Group :: string()) ->
-    ok.
-add_consumer(Topic, Group) ->
-    ekafka_topics_mgr_sup:add_topic(Topic, consumer, Group).
-
--spec get_partition_list(Topic :: string()) ->
-    {ok, list(integer())}.
-get_partition_list(Topic) ->
-    gen_server:call(ekafka_util:get_topic_manager_name(Topic), get_partition_list).
-
--spec consume(Topic :: string(), Partition :: undefined | integer()) ->
-    {error, Error :: atom()} | {ok, MsgList :: list(tuple())} | ok.
-consume(Topic, Partition) ->
-    ekafka_topic_sup:consume(async, Topic, Partition).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -86,13 +59,44 @@ stop(_State) ->
     ok.
 
 %%%===================================================================
-%%% Internal functions
+%%% Module APIs
 %%%===================================================================
 
-ensure_app_started(App) ->
-    case application:start(App) of
-        ok ->
-            ok;
-        {error, {already_started, _}} ->
-            ok
+-spec add_producer(Topic :: string()) ->
+    ok.
+add_producer(Topic) ->
+    ekafka_topics_mgr_sup:add_topic(Topic, producer, undefined).
+
+-spec produce(Topic :: string(), tuple() | list(tuple())) ->
+    {error, any()} | ok.
+produce(Topic, {Key, Value}) ->
+    produce(Topic, [{Key, Value}]);
+produce(Topic, KVList) ->
+    ekafka_util:check_topic_and_call(Topic,
+        {ekafka_topic_sup, produce, {sync, Topic, KVList}}).
+
+-spec add_consumer(Topic :: string(), Group :: string()) ->
+    ok.
+add_consumer(Topic, Group) ->
+    ekafka_topics_mgr_sup:add_topic(Topic, consumer, Group).
+
+-spec get_partition_list(Topic :: string()) ->
+    {ok, list(integer())}.
+get_partition_list(Topic) ->
+    case erlang:whereis(ekafka_util:get_topic_supervisor_name(Topic)) of
+        undefined ->
+            {error, invalid_operation};
+        _ ->
+            gen_server:call(ekafka_util:get_topic_manager_name(Topic), get_partition_list)
     end.
+
+-spec consume(Topic :: string()) ->
+    {error, Error :: atom()} | {ok, MsgList :: list(tuple())}.
+consume(Topic) ->
+    consume(Topic, undefined).
+
+-spec consume(Topic :: string(), Partition :: undefined | integer()) ->
+    {error, Error :: atom()} | {ok, MsgList :: list(tuple())}.
+consume(Topic, Partition) ->
+    ekafka_util:check_topic_and_call(Topic,
+        {ekafka_topic_sup, consume, {Topic, Partition}}).

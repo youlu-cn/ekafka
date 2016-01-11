@@ -15,6 +15,23 @@
 -compile(export_all).
 
 
+%% ensure_app_started/1
+ensure_app_started(App) ->
+    case application:start(App) of
+        ok ->
+            ok;
+        {error, {already_started, _}} ->
+            ok
+    end.
+
+check_topic_and_call(Topic, {M,F,A}) ->
+    case erlang:whereis(get_topic_supervisor_name(Topic)) of
+        undefined ->
+            {error, invalid_operation};
+        _ ->
+            M:F(A)
+    end.
+
 %% to_atom/1
 %% ====================================================================
 %% @doc : covert data to atom

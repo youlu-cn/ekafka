@@ -14,9 +14,9 @@
 -behaviour(supervisor).
 
 %% API
--export([start_link/3, start_worker_sup/1, start_offset_manager/3, consume/3]).
+-export([start_link/3, start_worker_sup/1, start_offset_manager/3]).
 
--export([produce/3]).
+-export([produce/1, consume/1]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -61,34 +61,35 @@ start_offset_manager(Topic, Group, Partitions) ->
 
     supervisor:start_child(ekafka_util:get_topic_supervisor_name(Topic), OffsetMgrSpec).
 
--spec produce(Type :: sync | async, Topic :: string(), KV :: list(tuple())) ->
+-spec produce({Type :: sync | async, Topic :: string(), KV :: list(tuple())}) ->
     {error, any()} | ok.
-produce(Type, Topic, [{Key, _V}|_] = KVList) ->
-    case gen_server:call(ekafka_util:get_topic_manager_name(Topic), {pick_produce_worker, Key}) of
+produce({Type, Topic, [{Key, _V}|_] = KVList}) ->
+    case gen_server:call(ekafka_util:get_topic_manager_name(Topic), {pick_worker, Key}) of
         {ok, Pid} ->
             gen_server:call(Pid, {produce, Type, KVList});
         {error, Error} ->
             {error, Error}
     end.
 
-consume(Type, Topic, Partition) ->
-    case gen_server:call(ekafka_util:get_topic_manager_name(Topic), {pick_consume_worker, Partition}) of
+-spec consume({Topic :: string(), Partition :: int32()}) ->
+    {error, Reason :: any()} | {ok, MsgList :: list()}.
+consume({Topic, Partition}) ->
+    case gen_server:call(ekafka_util:get_topic_manager_name(Topic), {pick_worker, Partition}) of
         {error, Error} ->
             {error, Error};
         {ok, Pid} ->
-            Res = gen_server:call(Pid, {consume, Type}),
-            case Type of
-                async ->
+            case gen_server:call(Pid, {consume, async}) of
+                ok ->
                     receive
                         {ekafka, fetched, []} ->
-                            consume(Type, Topic, Partition);
+                            consume({Topic, Partition});
                         {ekafka, fetched, MsgList} ->
                             {ok, MsgList};
                         {ekafka, error, Error} ->
                             {error, Error}
                     end;
-                _ ->
-                    Res
+                Error ->
+                    Error
             end
     end.
 

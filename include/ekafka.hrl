@@ -12,8 +12,8 @@
 %% Logs, ekafka_util:null to disable output
 -define(ERROR, io:format).
 -define(WARNING, io:format).
--define(INFO, ekafka_util:null).
--define(DEBUG, ekafka_util:null).
+-define(INFO, io:format).
+-define(DEBUG, io:format).
 
 
 %% Types
@@ -34,6 +34,8 @@
 
 -record(partition, {id         :: int32(),
                     lead       :: int32(),
+                    host       :: list() | tuple(),
+                    port       :: int32(),
                     offset= -1 :: int64(),
                     isr        :: list(int32())}).
 

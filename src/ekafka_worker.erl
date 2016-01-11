@@ -92,7 +92,7 @@ handle_call({produce, Type, KVList}, From, #state{topic = Topic, partition = Par
     case Role of
         producer ->
             Request = handle_produce_request(Topic, Part, KVList),
-            ?DEBUG("[W] produce request data: ~p~n", [Request]),
+            %?DEBUG("[W] produce request data: ~p~n", [Request]),
             NewTrace = get_trace_id(Trace),
             %% Type :: atom(), sync | async
             erlang:spawn(?MODULE, send_request, [Sock, {Type, From, self(), NewTrace, Request}]),
@@ -125,6 +125,21 @@ handle_call(_Request, _From, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
+handle_cast({kafka_broker_down, PartitionList}, #state{partition = Partition, sock = Sock} = State) ->
+    ?DEBUG("[W] handle kafka broker down message, brokers ~p~n", [PartitionList]),
+    #partition{id = PartID, lead = Lead} = Partition,
+    case lists:keyfind(PartID, 2, PartitionList) of
+        false ->
+            {noreply, State};
+        #partition{lead = Lead} ->
+            ?DEBUG("[W] lead broker not changed??~n", []),
+            {noreply, State};
+        NewPartition ->
+            ?INFO("[W] the broker of partition ~p changed~n", [PartID]),
+            gen_tcp:close(Sock),
+            erlang:send(self(), start_connection),
+            {noreply, State#state{partition = NewPartition}}
+    end;
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -142,19 +157,23 @@ handle_cast(_Request, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
-handle_info(start_connection, #state{topic = Name, partition = #partition{id = ID, lead = Lead}} = State) ->
+handle_info(start_connection, #state{topic = Name, partition = #partition{id = ID, host = Host, port = Port}} = State) ->
     ?INFO("[W] start worker connection, topic: ~p, partition: ~p~n", [Name, ID]),
-    case connect_to_lead_broker(Lead) of
-        undefined ->
-            ?ERROR("[W] init failed to connect broker, exit..~n", []),
-            {stop, broker_not_connected, State};
+    case gen_tcp:connect(Host, Port, ekafka_util:get_tcp_options()) of
         {ok, Sock} ->
             erlang:send(self(), init_begin_offset),
-            {noreply, State#state{sock = Sock}}
+            {noreply, State#state{sock = Sock}};
+        {error, econnrefused} ->
+            gen_server:cast(ekafka_util:get_topic_manager_name(Name), kafka_broker_down),
+            {noreply, State};
+        {error, Error} ->
+            ?ERROR("[W] connect to broker ~p:~p failed: ~p~n", [Host, Port, Error]),
+            {stop, Error, State}
     end;
 handle_info(init_begin_offset, #state{sock = Sock, topic = Name, role = Role, partition = #partition{id = PartID}} = State) ->
     case Role of
         producer ->
+            handle_worker_status_changed(Name, PartID, up),
             {noreply, State};
         consumer ->
             Offset = get_init_offset(Sock, Name, PartID),
@@ -165,37 +184,49 @@ handle_info(sync_group_offset, #state{topic = Name, partition = #partition{id = 
     case gen_server:call(ekafka_util:get_topic_offset_mgr_name(Name), {get_partition_offset, PartID}) of
         {ok, GroupOffset} when GroupOffset > Offset ->
             ?INFO("[W] got group consume offset, ~p:~p, value: ~p~n", [Name, PartID, GroupOffset]),
+            handle_worker_status_changed(Name, PartID, up),
             {noreply, State#state{offset = GroupOffset}};
         _ ->
             ?DEBUG("[W] no group consume offset for ~p:~p, use local: ~p~n", [Name, PartID, Offset]),
+            handle_worker_status_changed(Name, PartID, up),
             {noreply, State}
     end;
 
 %% handle socket
 handle_info({tcp, Sock, Data}, #state{sock = Sock, dict = Dict} = State) ->
-    ?DEBUG("[W] tcp data received, ~p, ~p~n", [self(), Data]),
+    %?DEBUG("[W] tcp data received, ~p, ~p~n", [self(), Data]),
     erlang:spawn(?MODULE, decode_response, [{?MODULE, query_response_api, Dict}, self(), Data]),
     {noreply, State};
-handle_info({re_connect, Reason, Times}, #state{topic = Name, partition = #partition{id = ID, lead = Lead}} = State) ->
+handle_info({re_connect, Reason, Times}, #state{topic = Name, partition = #partition{id = ID, host = Host, port = Port}} = State) ->
     ?WARNING("[W] ~p reconnecting to broker, reason: ~p, topic: ~p, partition: ~p~n", [Times, Reason, Name, ID]),
-    case connect_to_lead_broker(Lead) of
-        undefined ->
-            ?ERROR("[W] reconnect failed, retried times ~p~n", [Times]),
-            erlang:send_after(100, self(), {re_connect, Reason, Times + 1}),
-            {noreply, State};
+    case gen_tcp:connect(Host, Port, ekafka_util:get_tcp_options()) of
         {ok, Sock} ->
             ?INFO("[W] broker reconnected, ~p:~p~n", [Name, ID]),
-            {noreply, State#state{sock = Sock}}
+            case Times of
+                1 -> ok;
+                _ -> handle_worker_status_changed(Name, ID, up)
+            end,
+            {noreply, State#state{sock = Sock}};
+        {error, econnrefused} ->
+            handle_worker_status_changed(Name, ID, down),
+            gen_server:cast(ekafka_util:get_topic_manager_name(Name), kafka_broker_down),
+            {noreply, State};
+        {error, Error} ->
+            ?ERROR("[W] reconnect failed ~p, retried times ~p~n", [Error, Times]),
+            erlang:send_after(5000, self(), {re_connect, Reason, Times + 1}),
+            handle_worker_status_changed(Name, ID, down),
+            {noreply, State}
     end;
 handle_info({tcp_closed, Sock}, State) ->
     ?WARNING("[W] server closed connection, reconnect later~n", []),
     gen_tcp:close(Sock),
     erlang:send(self(), {re_connect, tcp_closed, 1}),
     {noreply, State};
-handle_info({tcp_error, Sock, Reason}, State) ->
+handle_info({tcp_error, Sock, Reason}, #state{topic = Name, partition = #partition{id = PartID}} = State) ->
     ?ERROR("[W] tcp error occurs, ~p, reconnect later~n", [Reason]),
     gen_tcp:close(Sock),
-    erlang:send_after(50, self(), {re_connect, tcp_error, 1}),
+    handle_worker_status_changed(Name, PartID, down),
+    erlang:send_after(1000, self(), {re_connect, tcp_error, 2}),
     {noreply, State};
 
 %% handle request callback
@@ -277,19 +308,21 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-connect_to_lead_broker(Lead) ->
-    case lists:keyfind(Lead, 1, ekafka_util:get_conf(brokers)) of
-        false ->
-            ?ERROR("[W] cannot found lead ~p broker in: ~p~n", [Lead, ekafka_util:get_conf(brokers)]),
-            undefined;
-        {Lead, {Host, Port}} ->
-            case gen_tcp:connect(Host, Port, ekafka_util:get_tcp_options()) of
-                {ok, Sock} ->
-                    {ok, Sock};
-                {error, Reason} ->
-                    ?ERROR("[W] connect to broker ~p failed: ~p~n", [Host, Reason]),
-                    undefined
-            end
+handle_worker_error(Name, Error) ->
+    case Error of
+        E when E =:= ?BROKER_NOT_AVAILABLE; E =:= ?NOT_LEADER_FOR_PARTITION ->
+            ?ERROR("[W] broker changed, cast message to manager~n", []),
+            gen_server:cast(ekafka_util:get_topic_manager_name(Name), kafka_broker_down);
+        _ ->
+            ok
+    end.
+
+handle_worker_status_changed(Topic, PartID, Up_Or_Down) ->
+    case Up_Or_Down of
+        up ->
+            gen_server:cast(ekafka_util:get_topic_manager_name(Topic), {worker_started, PartID, self()});
+        down ->
+            gen_server:cast(ekafka_util:get_topic_manager_name(Topic), {worker_interrupted, PartID, self()})
     end.
 
 get_init_offset(Sock, Name, PartID) ->
@@ -355,6 +388,7 @@ handle_produce_response(Type, {Pid, _} = From, #produce_response{topics = [#prod
             end;
         _ ->
             ?ERROR("[W] produce server error, topic: ~p, partition: ~p, error: ~p~n", [Name, ID, Error]),
+            handle_worker_error(Name, Error),
             case Type of
                 sync ->
                     gen_server:reply(From, {error, Error});
@@ -368,7 +402,7 @@ handle_consume_response(Type, {Pid, _} = From, #fetch_response{topics = Topics})
         case Topics of
             [] ->
                 {0, []};
-            [#fetch_res_topic{partitions = Partitions}] ->
+            [#fetch_res_topic{name = Name, partitions = Partitions}] ->
                 case Partitions of
                     [] ->
                         {0, []};
@@ -385,6 +419,7 @@ handle_consume_response(Type, {Pid, _} = From, #fetch_response{topics = Topics})
                                     {M2, [{{ID, Offset}, {Key, Value}} | L]}
                                 end, {0, []}, Messages);
                             _ ->
+                                handle_worker_error(Name, Error),
                                 {0, []}
                         end
                 end

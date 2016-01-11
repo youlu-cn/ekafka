@@ -247,7 +247,7 @@ commit_offset(Port, Group, Name, PartID, Offset) ->
 
 %% Kafka Offset Management
 start_kafka_offset_connection(Group) ->
-    case request_group_coordinator(Group) of
+    case request_group_coordinator(ekafka_util:get_conf(brokers), Group) of
         undefined ->
             undefined;
         #group_coordinator_response{error = Error, host = NewHost, port = Port} ->
@@ -294,9 +294,13 @@ commit_offset_to_kafka(Port, Group, Name, PartID, Offset) ->
             ?DEBUG("[O] offset committed ~p:~p, group: ~p, offset: ~p~n", [Name, PartID, Group, Offset])
     end.
 
-request_group_coordinator(Group) ->
-    [{_,{IP, Port}}|_T] = ekafka_util:get_conf(brokers),
+request_group_coordinator([], _Group) ->
+    ?ERROR("[O] all brokers are not available~n", []),
+    undefined;
+request_group_coordinator([{_,{IP, Port}} | Others], Group) ->
     case gen_tcp:connect(IP, Port, ekafka_util:get_tcp_options()) of
+        {error, econnrefused} ->
+            request_group_coordinator(Others, Group);
         {error, Reason} ->
             ?ERROR("[O] connect to broker ~p error: ~p~n", [IP, Reason]),
             undefined;

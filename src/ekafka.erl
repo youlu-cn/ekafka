@@ -85,7 +85,7 @@ add_consumer(Topic, Group) ->
 get_partition_list(Topic) ->
     case erlang:whereis(ekafka_util:get_topic_supervisor_name(Topic)) of
         undefined ->
-            {error, invalid_operation};
+            {error, no_topic};
         _ ->
             gen_server:call(ekafka_util:get_topic_manager_name(Topic), get_partition_list)
     end.

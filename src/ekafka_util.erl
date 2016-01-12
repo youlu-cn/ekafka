@@ -27,10 +27,18 @@ ensure_app_started(App) ->
 check_topic_and_call(Topic, {M,F,A}) ->
     case erlang:whereis(get_topic_supervisor_name(Topic)) of
         undefined ->
-            {error, invalid_operation};
+            {error, no_topic};
         _ ->
             M:F(A)
     end.
+
+to_topic(Name) ->
+    lists:foldr(fun(C, L) ->
+        case C of
+            $@ -> [$_ | L];
+            _  -> [C | L]
+        end
+    end, [], Name).
 
 %% to_atom/1
 %% ====================================================================
@@ -222,7 +230,7 @@ send_to_server_sync(Sock, Request) ->
         end,
     case gen_tcp:send(Sock, Bin) of
         {error, Reason} ->
-            ?ERROR("[SYNC] send to broker error: ~p", [Reason]),
+            ?ERROR("[SYNC] send to broker error: ~p~n", [Reason]),
             undefined;
         ok ->
             receive
@@ -231,7 +239,7 @@ send_to_server_sync(Sock, Request) ->
                     Res
             after
                 10000 ->
-                    ?ERROR("[SYNC] timeout", []),
+                    ?ERROR("[SYNC] timeout~n", []),
                     undefined
             end
     end.

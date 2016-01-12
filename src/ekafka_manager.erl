@@ -168,6 +168,7 @@ handle_cast(kafka_broker_down, #state{topic = Name, monitors = PidList, partitio
                     lists:foreach(fun(Pid) ->
                         gen_server:cast(Pid, {kafka_broker_down, PartitionList})
                     end, PidList),
+                    gen_server:cast(ekafka_util:get_topic_offset_mgr_name(Name), {kafka_broker_down, PartitionList}),
                     {noreply, State#state{partitions = Partitions, workers = NewWorkers}}
             end
     end;
@@ -360,12 +361,15 @@ get_topic_metadata_by_kafka(Name) ->
                         E when E =:= ?NO_ERROR; E =:= ?REPLICA_NOT_AVAILABLE ->
                             to_partitions(Partitions);
                         ?LEADER_NOT_AVAILABLE ->
-                            ?INFO("[MGR] topic ~p is creating, try later~n", [Name]),
+                            ?INFO("[MGR] partition lead of topic ~p in election, try later~n", [Name]),
                             undefined;
                         _ ->
                             ?ERROR("[MGR] Kafka response error: ~p~n", [ekafka_util:get_error_message(Err3)]),
                             {error, Err3}
                     end;
+                ?LEADER_NOT_AVAILABLE ->
+                    ?INFO("[MGR] creating topic ~p, try later~n", [Name]),
+                    undefined;
                 _ ->
                     ?ERROR("[MGR] Kafka response topic error: ~p~n", [ekafka_util:get_error_message(Err1)]),
                     {error, Err1}
@@ -463,7 +467,7 @@ get_partitions(Pid, Name, PartitionIDs) ->
                             _ ->
                                 LeadID
                         end
-                    end, 0, binary:split(Bin1, <<",">>, [global, trim_all])),
+                    end, 0, binary:split(Bin1, <<",">>, [global])),
                 {Host, Port} = get_leader_hosts(Leader),
                 [#partition{id = ekafka_util:to_integer(ID), lead = Leader, isr = get_isr_list(Bin1), host = Host, port = Port} | L]
         end
@@ -471,7 +475,7 @@ get_partitions(Pid, Name, PartitionIDs) ->
 
 get_isr_list(Bin) ->
     [_H, T] = binary:split(Bin, <<"isr:">>),
-    [IsrBinL|_] = binary:split(T, [<<"[">>, <<"]">>], [global, trim_all]),
+    [<<>>,IsrBinL|_] = binary:split(T, [<<"[">>, <<"]">>], [global]),
     lists:foldr(fun(ID, L) ->
         [ekafka_util:to_integer(ID) | L]
-    end, [], binary:split(IsrBinL, <<",">>, [global, trim_all])).
+    end, [], binary:split(IsrBinL, <<",">>, [global])).

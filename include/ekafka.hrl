@@ -10,10 +10,10 @@
 
 
 %% Logs, ekafka_util:null to disable output
--define(ERROR, io:format).
+-define(ERROR,   io:format).
 -define(WARNING, io:format).
--define(INFO, io:format).
--define(DEBUG, io:format).
+-define(INFO,    ekafka_util:null).
+-define(DEBUG,   ekafka_util:null).
 
 
 %% Types

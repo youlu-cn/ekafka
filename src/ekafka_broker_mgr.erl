@@ -230,7 +230,7 @@ get_brokers(Pid, BrokerIDs) ->
                             _ ->
                                 {IP, Port}
                         end
-                    end, {undefined, undefined}, binary:split(Bin1, <<",">>, [global, trim_all])),
+                    end, {undefined, undefined}, binary:split(Bin1, <<",">>, [global])),  %% old erlang version not support trim_all
                 [{Broker, Host} | L]
         end
     end, [], BrokerIDs).

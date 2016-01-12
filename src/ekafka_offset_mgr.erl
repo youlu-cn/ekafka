@@ -28,6 +28,7 @@
                 group          :: string(),
                 partitions     :: [#partition{}],
                 offsets   = [] :: [{int32(), int64()}],
+                hosts          :: {string(), integer()},  %% only for Kafka offset commit
                 port           :: port() | pid()}).
 
 %%%===================================================================
@@ -116,6 +117,20 @@ handle_cast({message_consumed, PartID, Offset}, #state{topic = Name, offsets = O
             ?DEBUG("[O] message consumed ~p:~p, old: ~p, new: ~p~n", [Name, PartID, Offsets, NewOffsets]),
             {noreply, State#state{offsets = NewOffsets}}
     end;
+handle_cast({kafka_broker_down, _PartitionList}, #state{group = Group} = State) ->
+    ?DEBUG("[O] handle kafka broker down message~n", []),
+    case ekafka_util:get_conf(zookeeper) of
+        undefined ->
+            case start_kafka_offset_connection(Group) of
+                undefined ->
+                    {noreply, State};
+                {Sock, Hosts} ->
+                    ?DEBUG("[O] offset manager reconnected to ~p~n", [Hosts]),
+                    {noreply, State#state{port = Sock, hosts = Hosts}}
+            end;
+        _ ->
+            {noreply, State}
+    end;
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -137,10 +152,14 @@ handle_info(start_connection, #state{group = Group} = State) ->
     case start_offset_connection(Group) of
         undefined ->
             {stop, error_group_coordinator, State};
-        Port ->
-            ?DEBUG("[O] group coordinator connected~n", []),
+        {Sock, Hosts} ->
+            ?DEBUG("[O] group coordinator ~p connected~n", [Hosts]),
             erlang:send(self(), sync_consume_offset),
-            {noreply, State#state{port = Port}}
+            {noreply, State#state{port = Sock, hosts = Hosts}};
+        ZkPid ->
+            ?DEBUG("[O] zookeeper connected~n", []),
+            erlang:send(self(), sync_consume_offset),
+            {noreply, State#state{port = ZkPid}}
     end;
 handle_info(sync_consume_offset, #state{group = Group, topic = Name, partitions = Partitions, port = Port} = State) ->
     NewState =
@@ -176,6 +195,33 @@ handle_info(auto_commit_offset, #state{group = Group, topic = Name, partitions =
         end, [], Partitions),
     erlang:send_after(ekafka_util:get_offset_auto_commit_timeout(), self(), auto_commit_offset),
     {noreply, State#state{partitions = NewPartitions}};
+
+%% Kafka socket callback
+handle_info({re_connect, Reason, Times}, #state{topic = Name, group = Group, hosts = {Host, Port}} = State) ->
+    ?WARNING("[O] ~p reconnecting to broker, reason: ~p, topic: ~p, group: ~p~n", [Times, Reason, Name, Group]),
+    case gen_tcp:connect(Host, Port, ekafka_util:get_tcp_options()) of
+        {ok, Sock} ->
+            ?INFO("[O] broker reconnected, ~p:~p~n", [Group, Name]),
+            {noreply, State#state{port = Sock}};
+        {error, econnrefused} ->
+            gen_server:cast(ekafka_util:get_topic_manager_name(Name), kafka_broker_down),
+            {noreply, State};
+        {error, Error} ->
+            ?ERROR("[O] reconnect failed ~p, retried times ~p~n", [Error, Times]),
+            erlang:send_after(5000, self(), {re_connect, Reason, Times + 1}),
+            {noreply, State}
+    end;
+handle_info({tcp_closed, Sock}, State) ->
+    ?WARNING("[O] server closed connection, reconnect later~n", []),
+    gen_tcp:close(Sock),
+    erlang:send(self(), {re_connect, tcp_closed, 1}),
+    {noreply, State};
+handle_info({tcp_error, Sock, Reason}, #state{topic = Name, group = Group} = State) ->
+    ?ERROR("[O] ~p:~p connection error occurs, ~p, reconnect later~n", [Group, Name, Reason]),
+    gen_tcp:close(Sock),
+    erlang:send_after(1000, self(), {re_connect, tcp_error, 2}),
+    {noreply, State};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -250,16 +296,16 @@ start_kafka_offset_connection(Group) ->
     case request_group_coordinator(ekafka_util:get_conf(brokers), Group) of
         undefined ->
             undefined;
-        #group_coordinator_response{error = Error, host = NewHost, port = Port} ->
-            ?INFO("[O] group coordinator res: ~p, hosts: ~p~n", [Error, {NewHost, Port}]),
+        #group_coordinator_response{error = Error, host = Host, port = Port} ->
+            ?INFO("[O] group coordinator res: ~p, hosts: ~p~n", [Error, {Host, Port}]),
             case Error of
                 ?NO_ERROR ->
-                    case gen_tcp:connect(NewHost, Port, ekafka_util:get_tcp_options()) of
+                    case gen_tcp:connect(Host, Port, ekafka_util:get_tcp_options()) of
                         {error, Reason} ->
-                            ?ERROR("[O] connect to group coordinator ~p error: ~p~n", [NewHost, Reason]),
+                            ?ERROR("[O] connect to group coordinator ~p error: ~p~n", [Host, Reason]),
                             undefined;
                         {ok, Sock} ->
-                            Sock
+                            {Sock, {Host, Port}}
                     end;
                 _ ->
                     ?ERROR("[O] group coordinator response error: ~p~n", [ekafka_util:get_error_message(Error)]),
@@ -289,7 +335,8 @@ commit_offset_to_kafka(Port, Group, Name, PartID, Offset) ->
     Request = #offset_commit_request{group_id = Group, topics = [Topic]},
     case ekafka_util:send_to_server_sync(Port, Request) of
         undefined ->
-            ?ERROR("[O] commit offset failed, ~p:~p, group: ~p~n", [Name, PartID, Group]);
+            ?WARNING("[O] commit offset failed, ~p:~p, group: ~p~n", [Name, PartID, Group]),
+            gen_server:cast(ekafka_util:get_topic_manager_name(Name), kafka_broker_down);
         #offset_commit_response{} ->
             ?DEBUG("[O] offset committed ~p:~p, group: ~p, offset: ~p~n", [Name, PartID, Group, Offset])
     end.

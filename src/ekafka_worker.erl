@@ -125,8 +125,8 @@ handle_call(_Request, _From, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
-handle_cast({kafka_broker_down, PartitionList}, #state{partition = Partition, sock = Sock} = State) ->
-    ?DEBUG("[W] handle kafka broker down message, brokers ~p~n", [PartitionList]),
+handle_cast({kafka_broker_down, PartitionList}, #state{partition = Partition, sock = Sock, dict = Dict} = State) ->
+    ?WARNING("[W] handle kafka broker down message, brokers ~p~n", [PartitionList]),
     #partition{id = PartID, lead = Lead} = Partition,
     case lists:keyfind(PartID, 2, PartitionList) of
         false ->
@@ -135,10 +135,11 @@ handle_cast({kafka_broker_down, PartitionList}, #state{partition = Partition, so
             ?DEBUG("[W] lead broker not changed??~n", []),
             {noreply, State};
         NewPartition ->
-            ?INFO("[W] the broker of partition ~p changed~n", [PartID]),
+            ?WARNING("[W] the broker of partition ~p changed~n", [PartID]),
             gen_tcp:close(Sock),
+            handle_pending_request(Dict),
             erlang:send(self(), start_connection),
-            {noreply, State#state{partition = NewPartition}}
+            {noreply, State#state{partition = NewPartition, dict = dict:new()}}
     end;
 handle_cast(_Request, State) ->
     {noreply, State}.
@@ -185,7 +186,7 @@ handle_info(sync_group_offset, #state{topic = Name, partition = #partition{id = 
         {ok, GroupOffset} when GroupOffset > Offset ->
             ?INFO("[W] got group consume offset, ~p:~p, value: ~p~n", [Name, PartID, GroupOffset]),
             handle_worker_status_changed(Name, PartID, up),
-            {noreply, State#state{offset = GroupOffset}};
+            {noreply, State#state{offset = GroupOffset + 1}};
         _ ->
             ?DEBUG("[W] no group consume offset for ~p:~p, use local: ~p~n", [Name, PartID, Offset]),
             handle_worker_status_changed(Name, PartID, up),
@@ -197,8 +198,9 @@ handle_info({tcp, Sock, Data}, #state{sock = Sock, dict = Dict} = State) ->
     %?DEBUG("[W] tcp data received, ~p, ~p~n", [self(), Data]),
     erlang:spawn(?MODULE, decode_response, [{?MODULE, query_response_api, Dict}, self(), Data]),
     {noreply, State};
-handle_info({re_connect, Reason, Times}, #state{topic = Name, partition = #partition{id = ID, host = Host, port = Port}} = State) ->
+handle_info({re_connect, Reason, Times}, #state{topic = Name, dict = Dict, partition = #partition{id = ID, host = Host, port = Port}} = State) ->
     ?WARNING("[W] ~p reconnecting to broker, reason: ~p, topic: ~p, partition: ~p~n", [Times, Reason, Name, ID]),
+    handle_pending_request(Dict),
     case gen_tcp:connect(Host, Port, ekafka_util:get_tcp_options()) of
         {ok, Sock} ->
             ?INFO("[W] broker reconnected, ~p:~p~n", [Name, ID]),
@@ -206,7 +208,7 @@ handle_info({re_connect, Reason, Times}, #state{topic = Name, partition = #parti
                 1 -> ok;
                 _ -> handle_worker_status_changed(Name, ID, up)
             end,
-            {noreply, State#state{sock = Sock}};
+            {noreply, State#state{sock = Sock, dict = dict:new()}};
         {error, econnrefused} ->
             handle_worker_status_changed(Name, ID, down),
             gen_server:cast(ekafka_util:get_topic_manager_name(Name), kafka_broker_down),
@@ -308,6 +310,17 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+handle_pending_request(Dict) ->
+    lists:foreach(fun({_key, #request_state{type = Type, from = From}}) ->
+        {Pid, _} = From,
+        case Type of
+            sync ->
+                gen_server:reply(From, {error, server_down});
+            async ->
+                erlang:send(Pid, {ekafka, error, server_down})
+        end
+    end, dict:to_list(Dict)).
+
 handle_worker_error(Name, Error) ->
     case Error of
         E when E =:= ?BROKER_NOT_AVAILABLE; E =:= ?NOT_LEADER_FOR_PARTITION ->
@@ -393,7 +406,7 @@ handle_produce_response(Type, {Pid, _} = From, #produce_response{topics = [#prod
                 sync ->
                     gen_server:reply(From, {error, Error});
                 async ->
-                    erlang:send(Pid, {ekafka, error, error_produce_error})
+                    erlang:send(Pid, {ekafka, error, server_error})
             end
     end.
 

@@ -155,7 +155,7 @@ handle_cast(kafka_broker_down, #state{topic = Name, monitors = PidList, partitio
             ?ERROR("[MGR] get topic ~p metadata failed ~p~n", [Name, Error]),
             {stop, Error, State};
         Partitions ->
-            ?INFO("[MGR] got topic ~p metadata, partitions: ~p~n", [Name, Partitions]),
+            ?WARNING("[MGR] got topic ~p metadata, partitions: ~p~n", [Name, Partitions]),
             case check_which_broker_down(OldPartitions, Partitions) of
                 [] ->
                     {noreply, State};
@@ -475,7 +475,7 @@ get_partitions(Pid, Name, PartitionIDs) ->
 
 get_isr_list(Bin) ->
     [_H, T] = binary:split(Bin, <<"isr:">>),
-    [<<>>,IsrBinL|_] = binary:split(T, [<<"[">>, <<"]">>], [global]),
+    [<<>>,IsrBinL|_] = binary:split(T, [<<"[">>, <<"]">>], [global]), % old version does not support trim_all option
     lists:foldr(fun(ID, L) ->
         [ekafka_util:to_integer(ID) | L]
     end, [], binary:split(IsrBinL, <<",">>, [global])).

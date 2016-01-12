@@ -66,7 +66,7 @@ start_offset_manager(Topic, Group, Partitions) ->
 produce({Type, Topic, [{Key, _V}|_] = KVList}) ->
     case gen_server:call(ekafka_util:get_topic_manager_name(Topic), {pick_worker, Key}) of
         {ok, Pid} ->
-            gen_server:call(Pid, {produce, Type, KVList});
+            gen_server:call(Pid, {produce, Type, KVList}, infinity);
         {error, Error} ->
             {error, Error}
     end.
